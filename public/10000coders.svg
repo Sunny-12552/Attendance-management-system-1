@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 450 250" role="img" aria-label="10000 Coders Right Bright logo">
+  <g fill="#ff8a00" font-family="Arial, Helvetica, sans-serif" font-weight="700">
+    <text x="12" y="98" font-size="96">1</text>
+    <text x="28" y="207" font-size="84">{}</text>
+    <text x="8" y="241" font-size="25" font-weight="400">Right</text>
+    <text x="210" y="241" font-size="25" font-weight="400">Bright</text>
+  </g>
+  <g fill="#ff8a00">
+    <path d="M286 42h47l10 6v34l-10 6h-47l-10-6V48z"/>
+    <path d="M291 57l13 11-13 12 5 5 19-17-19-17z" fill="#050505"/>
+    <path d="M323 51h7l-15 34h-7z" fill="#050505"/>
+    <path d="M331 57l-5 5 9 6-9 7 5 5 16-12z" fill="#050505"/>
+  </g>
+</svg>

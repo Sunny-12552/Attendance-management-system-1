@@ -1,0 +1,32 @@
+const $ = (id) => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+const token = params.get('session');
+let config = { subjects: [], batches: [] };
+let records = [];
+
+async function api(path, options = {}) {
+  const response = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...options });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || 'Something went wrong.');
+  return data;
+}
+function show(id) { document.querySelectorAll('.view').forEach((view) => view.classList.add('hidden')); $(id).classList.remove('hidden'); document.body.classList.toggle('branded-page', id === 'login-view' || id === 'student-view'); }
+function message(id, text = '') { $(id).textContent = text; }
+function fillSelect(id, values, first = '') { const el = $(id); el.innerHTML = first + values.map((value) => `<option value="${value}">${value}</option>`).join(''); }
+function escapeHtml(value) { return String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[c])); }
+
+async function loadConfig() { config = await api('/api/config'); fillSelect('student-batch', config.batches); fillSelect('subject', config.subjects); fillSelect('scope-batch', config.batches, '<option value="">All batches</option>'); fillSelect('correction-batch', config.batches); fillSelect('correction-subject', config.subjects); }
+async function initStudent() {
+  show('student-view');
+  try { const session = await api(`/api/sessions/${encodeURIComponent(token)}`); $('session-summary').textContent = `${session.subject}${session.batch ? ` · ${session.batch} only` : ''} · QR active for 30 minutes`; }
+  catch (error) { $('session-summary').textContent = error.message; $('attendance-form').classList.add('hidden'); }
+}
+$('attendance-form').addEventListener('submit', async (event) => { event.preventDefault(); message('student-message', 'Saving...'); try { const result = await api('/api/attendance', { method: 'POST', body: JSON.stringify({ token, name: $('student-name').value, batch: $('student-batch').value }) }); $('attendance-form').classList.add('hidden'); $('confirmation').classList.remove('hidden'); $('confirmation').innerHTML = `<strong>Attendance marked successfully.</strong><br>${escapeHtml(result.name)} · ${escapeHtml(result.batch)} · ${escapeHtml(result.course)}<br>${escapeHtml(result.subject)} · ${escapeHtml(result.date)} · ${escapeHtml(result.status)}`; } catch (error) { message('student-message', error.message); } });
+$('login-form').addEventListener('submit', async (event) => { event.preventDefault(); message('login-message', 'Opening...'); try { await api('/api/login', { method: 'POST', body: JSON.stringify({ password: $('password').value }) }); await initDashboard(); } catch (error) { message('login-message', error.message); } });
+$('logout').addEventListener('click', async () => { await api('/api/logout', { method: 'POST' }); $('logout').classList.add('hidden'); show('login-view'); });
+$('session-form').addEventListener('submit', async (event) => { event.preventDefault(); message('session-message', 'Generating...'); try { const session = await api('/api/sessions', { method: 'POST', body: JSON.stringify({ subject: $('subject').value, batch: $('scope-batch').value }) }); $('qr-result').classList.remove('hidden'); $('qr-result').innerHTML = `<img src="${session.qr}" alt="Attendance QR code"><p>Active for 30 minutes · <a href="${session.url}" target="_blank">Open student page ↗</a></p><button class="secondary" id="close-session" type="button">Close session and mark absences</button>`; $('close-session').addEventListener('click', async () => { $('close-session').disabled = true; $('close-session').textContent = 'Finalizing...'; try { const result = await api(`/api/sessions/${session.id}/close`, { method: 'POST' }); $('close-session').textContent = `Closed · ${result.added} absences added`; await refreshReport(); } catch (error) { $('close-session').disabled = false; $('close-session').textContent = error.message; } }); message('session-message'); } catch (error) { message('session-message', error.message); } });
+async function refreshReport() { try { records = await api('/api/report'); const percentages = await api('/api/percentages'); const date = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date()); const today = records.filter((r) => r.date === date); $('total-count').textContent = today.length; $('present-count').textContent = today.filter((r) => r.status === 'Present').length; $('absent-count').textContent = today.filter((r) => r.status === 'Absent').length; $('records').innerHTML = records.slice(-50).reverse().map((r) => `<tr><td>${escapeHtml(r.date)}</td><td>${escapeHtml(r.name)}</td><td>${escapeHtml(r.batch)}</td><td>${escapeHtml(r.subject)}</td><td class="status ${r.status.toLowerCase()}">${escapeHtml(r.status)}</td></tr>`).join('') || '<tr><td colspan="5">No records yet.</td></tr>'; $('percentages').innerHTML = percentages.filter((r) => r.total > 0).map((r) => `<tr><td>${escapeHtml(r.name)}</td><td>${escapeHtml(r.batch)}</td><td>${escapeHtml(r.subject)}</td><td>${r.attended}</td><td>${r.total}</td><td class="status">${r.subjectPercentage}%</td><td class="status">${r.overallPercentage}%</td></tr>`).join('') || '<tr><td colspan="7">No conducted classes yet.</td></tr>'; } catch (error) { message('session-message', error.message); } }
+$('refresh').addEventListener('click', refreshReport);
+$('correction-form').addEventListener('submit', async (event) => { event.preventDefault(); message('correction-message', 'Saving...'); try { await api('/api/correct', { method: 'POST', body: JSON.stringify({ name: $('correction-name').value, batch: $('correction-batch').value, subject: $('correction-subject').value, status: $('correction-status').value }) }); message('correction-message', 'Today\'s correction saved.'); await refreshReport(); } catch (error) { message('correction-message', error.message); } });
+async function initDashboard() { show('dashboard-view'); $('logout').classList.remove('hidden'); await refreshReport(); }
+(async function boot() { await loadConfig(); if (token) return initStudent(); const me = await api('/api/me'); if (me.instructor) return initDashboard(); show('login-view'); })().catch((error) => { show('login-view'); message('login-message', error.message); });

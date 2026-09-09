@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#153b3b">
+  <title>Rollcall | QR Attendance</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/branded.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar"><a class="brand" href="/">rollcall<span>.</span></a><button id="logout" class="link-button hidden">Log out</button></header>
+    <section id="student-view" class="view hidden">
+      <div class="eyebrow">STUDENT CHECK-IN</div>
+      <h1>Be counted.<br><em>Keep moving.</em></h1>
+      <p class="lead">Enter your details to mark attendance for the active class.</p>
+      <div id="session-summary" class="session-summary"></div>
+      <form id="attendance-form" class="panel form-grid">
+        <label>Student name<input id="student-name" name="name" autocomplete="name" placeholder="e.g. Rahul Kumar" required></label>
+        <label>Batch<select id="student-batch" name="batch" required></select></label>
+        <button class="primary" type="submit">Mark attendance <span>→</span></button>
+        <p id="student-message" class="message" role="alert"></p>
+      </form>
+      <section id="confirmation" class="confirmation hidden"></section>
+    </section>
+    <section id="login-view" class="view narrow hidden">
+      <div class="eyebrow">INSTRUCTOR ACCESS</div><h1>Attendance,<br><em>in control.</em></h1>
+      <p class="lead">One password opens your attendance desk.</p>
+      <form id="login-form" class="panel form-grid"><label>Instructor password<input id="password" type="password" autocomplete="current-password" required></label><button class="primary" type="submit">Open dashboard <span>→</span></button><p id="login-message" class="message" role="alert"></p></form>
+    </section>
+    <section id="dashboard-view" class="view hidden">
+      <div class="dashboard-head"><div><div class="eyebrow">INSTRUCTOR DESK</div><h1>Today’s attendance</h1><p class="lead">Create a room, share its QR, and let the sheet do the bookkeeping.</p></div><a class="sheet-link" href="https://sheets.google.com" target="_blank" rel="noreferrer">Open Sheets ↗</a></div>
+      <div class="dashboard-grid">
+        <section class="panel generator"><div class="section-label">NEW SESSION</div><form id="session-form" class="form-grid"><label>Subject<select id="subject" required></select></label><label>Batch scope <span class="muted">optional</span><select id="scope-batch"><option value="">All batches</option></select></label><button class="primary" type="submit">Generate QR <span>↗</span></button><p id="session-message" class="message" role="alert"></p></form><div id="qr-result" class="qr-result hidden"></div></section>
+        <section class="panel stats"><div class="section-label">LIVE TOTALS</div><div class="stat-number" id="total-count">0</div><p>records loaded today</p><div class="stat-rule"></div><div class="mini-stats"><div><strong id="present-count">0</strong><span>present</span></div><div><strong id="absent-count">0</strong><span>absent</span></div></div></section>
+      </div>
+      <section class="panel table-panel"><div class="table-head"><div><div class="section-label">ATTENDANCE LOG</div><h2>Recent records</h2></div><button id="refresh" class="secondary">Refresh</button></div><div class="table-wrap"><table><thead><tr><th>Date</th><th>Student</th><th>Batch</th><th>Subject</th><th>Status</th></tr></thead><tbody id="records"></tbody></table></div></section>
+      <section class="panel table-panel"><div class="table-head"><div><div class="section-label">PERCENTAGE REPORT</div><h2>Subject-wise attendance</h2></div></div><div class="table-wrap"><table><thead><tr><th>Student</th><th>Batch</th><th>Subject</th><th>Attended</th><th>Total classes</th><th>Subject %</th><th>Overall %</th></tr></thead><tbody id="percentages"></tbody></table></div></section>
+        <section class="panel correction-panel"><div class="section-label">TODAY ONLY</div><h2>Instructor correction</h2><p class="lead">Use this for a student who was physically present but could not scan.</p><form id="correction-form" class="correction-grid"><input id="correction-name" placeholder="Student name" required><select id="correction-batch" required></select><select id="correction-subject" required></select><select id="correction-status" required><option>Present</option><option>Absent</option></select><button class="secondary" type="submit">Save correction</button></form><p id="correction-message" class="message" role="alert"></p></section>
+    </section>
+    <footer><span>server time · Asia/Kolkata</span><span>Google Sheets storage</span></footer>
+  </main>
+  <script src="/app.js" defer></script>
+</body>
+</html>
