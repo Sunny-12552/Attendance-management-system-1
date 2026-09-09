@@ -414,7 +414,15 @@ app.post('/api/sessions', requireInstructor, async (req, res) => {
   const token = sessionToken(id);
   const baseUrl = resolvePublicUrl(req);
   const url = `${baseUrl}/?session=${encodeURIComponent(token)}`;
-  res.json({ ...session, url, qr: await QRCode.toDataURL(url) });
+  res.json({
+  ...session,
+  url,
+  qr: await QRCode.toDataURL(url, {
+    width: 500,
+    margin: 4,
+    errorCorrectionLevel: 'M'
+  })
+});
 });
 app.get('/api/sessions/:token', (req, res) => {
   const session = readSession(req.params.token);
