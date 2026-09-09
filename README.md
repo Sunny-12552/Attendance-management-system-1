@@ -51,6 +51,7 @@ Edit `.env`:
 - `GOOGLE_SPREADSHEET_ID`: spreadsheet ID.
 - `GOOGLE_SERVICE_ACCOUNT_JSON`: the full service-account JSON on one line.
 - `APP_URL`: the public HTTPS URL used in QR codes after deployment.
+- `MIN_ATTENDANCE_PERCENTAGE`: optional minimum threshold for the student attendance warning. Defaults to `75`.
 
 Then run:
 
@@ -68,6 +69,7 @@ Open `http://localhost:3000`. The instructor logs in with the configured passwor
 3. Students submit a name and batch. The server maps the course and writes `Present`.
 4. Instructor clicks **Close session and mark absences**. Every roster student in scope without a record for the server date receives `Absent`.
 5. The `Percentage` tab is rebuilt from present and absent rows, so absences count toward total classes.
+6. After marking attendance, students can check their own subject attendance. The lookup uses the subject matrix date columns, excludes future dates, and matches by name plus batch.
 
 Close a session only after the class is finished. Past records are not exposed through correction controls. Google Sheets itself should be restricted to trusted administrators.
 

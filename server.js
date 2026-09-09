@@ -26,6 +26,11 @@ const sessions = new Map();
 const instructors = new Map();
 const sessionSecret = process.env.SESSION_SECRET || 'development-secret-change-me';
 const qrMinutes = Number(process.env.QR_MINUTES || Number.MAX_SAFE_INTEGER);
+const minAttendancePercentage = Number(process.env.MIN_ATTENDANCE_PERCENTAGE || 75);
+const attendanceValidationRule = { condition: { type: 'ONE_OF_LIST', values: [{ userEnteredValue: 'Present' }, { userEnteredValue: 'Absent' }, { userEnteredValue: 'Holiday' }] }, showCustomUi: true, strict: false };
+const holidays = new Set((process.env.HOLIDAYS || '').split(',').map((date) => date.trim()).filter((date) => /^\d{4}-\d{2}-\d{2}$/.test(date)));
+
+function ledgerSheetName(subject) { return `${subject} Ledger`; }
 
 function resolvePublicUrl(req) {
   const configured = (process.env.APP_URL || '').trim();
@@ -110,38 +115,251 @@ async function ensureSheetLayout() {
   if (layoutPromise) return layoutPromise;
   layoutPromise = (async () => {
     const service = getSheets();
-    const metadata = await service.spreadsheets.get({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, fields: 'sheets.properties.title' });
+    const metadata = await service.spreadsheets.get({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, fields: 'sheets.properties.title,sheets.properties.sheetId' });
+    const sheetIds = new Map(metadata.data.sheets.map((sheet) => [sheet.properties.title, sheet.properties.sheetId]));
     const existing = new Set(metadata.data.sheets.map((sheet) => sheet.properties.title));
     const required = ['Students', 'Percentage', ...subjects];
-    const missing = required.filter((title) => !existing.has(title));
+    const renameRequests = [];
+    const usedLegacyTitles = new Set();
+    for (let i = 0; i < subjects.length; i += 1) {
+      const desiredTitle = subjects[i];
+      if (existing.has(desiredTitle)) continue;
+
+      const legacyCandidates = [`Subject ${i + 1}`, `Sheet${i + 1}`, 'Sheet1'];
+      const legacyTitle = legacyCandidates.find((candidate) => existing.has(candidate) && !usedLegacyTitles.has(candidate) && candidate !== desiredTitle);
+      if (!legacyTitle) continue;
+
+      const sheetId = sheetIds.get(legacyTitle);
+      if (sheetId !== undefined) {
+        renameRequests.push({ updateSheetProperties: { properties: { sheetId, title: desiredTitle }, fields: 'title' } });
+        usedLegacyTitles.add(legacyTitle);
+      }
+    }
+    if (renameRequests.length) {
+      await service.spreadsheets.batchUpdate({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, requestBody: { requests: renameRequests } });
+    }
+    const updatedMetadata = await service.spreadsheets.get({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, fields: 'sheets.properties.title' });
+    const refreshedExisting = new Set(updatedMetadata.data.sheets.map((sheet) => sheet.properties.title));
+    const missing = required.filter((title) => !refreshedExisting.has(title));
     if (missing.length) {
       await service.spreadsheets.batchUpdate({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, requestBody: { requests: missing.map((title) => ({ addSheet: { properties: { title } } })) } });
     }
     const headers = [
-      ['Students', ['Student Name', 'Batch']],
+      ['Students', ['Student ID', 'Student Name', 'Batch']],
       ['Percentage', ['Student Name', 'Batch', 'Course', 'Subject', 'Attended Classes', 'Total Classes', 'Subject Percentage', 'Full-Course / Overall Percentage']],
-      ...subjects.map((subject) => [subject, sheetHeaders])
+      ...subjects.map((subject) => [subject, ['Student ID', 'Student Name', 'Batch']])
     ];
     await service.spreadsheets.values.batchUpdate({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, requestBody: { valueInputOption: 'USER_ENTERED', data: headers.map(([title, values]) => ({ range: `'${title}'!A1`, values: [values] })) } });
   })();
   return layoutPromise;
 }
+async function syncSubjectMatrix(subject) {
+  const result = await getSheets().spreadsheets.values.get({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, range: `'${subject}'!A1:ZZ10000` });
+  if (!(result.data.values || []).length) {
+    await getSheets().spreadsheets.values.update({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, range: `'${subject}'!A1`, valueInputOption: 'USER_ENTERED', requestBody: { values: [['Student ID', 'Student Name', 'Batch']] } });
+  }
+}
+async function syncAllSubjectMatrices() {
+  await ensureSheetLayout();
+  await Promise.all(subjects.map((subject) => syncSubjectMatrix(subject)));
+}
+async function syncAttendanceValidation() {
+  const metadata = await getSheets().spreadsheets.get({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, fields: 'sheets.properties.title,sheets.properties.sheetId' });
+  const requests = [];
+  for (const sheet of metadata.data.sheets) {
+    if (!subjects.includes(sheet.properties.title)) continue;
+    const values = (await getSheets().spreadsheets.values.get({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, range: `'${sheet.properties.title}'!A1:ZZ10000` })).data.values || [];
+    const headers = values[0] || [];
+    const dateIndexes = headers.map((value, index) => index >= 3 && /^\d{4}-\d{2}-\d{2}$/.test(String(value || '').trim()) ? index : -1).filter((index) => index >= 0);
+    const studentRows = values.slice(1).map((row, index) => index + 1).filter((rowIndex) => {
+      const row = values[rowIndex];
+      return String(row?.[1] || '').trim() && String(row?.[2] || '').trim();
+    });
+    for (const dateIndex of dateIndexes) {
+      for (const rowIndex of studentRows) {
+        requests.push({ setDataValidation: { range: { sheetId: sheet.properties.sheetId, startRowIndex: rowIndex, endRowIndex: rowIndex + 1, startColumnIndex: dateIndex, endColumnIndex: dateIndex + 1 }, rule: attendanceValidationRule } });
+      }
+    }
+  }
+  for (let index = 0; index < requests.length; index += 500) await getSheets().spreadsheets.batchUpdate({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, requestBody: { requests: requests.slice(index, index + 500) } });
+}
+function columnName(index) {
+  let value = '';
+  let current = index + 1;
+  while (current > 0) {
+    const remainder = (current - 1) % 26;
+    value = String.fromCharCode(65 + remainder) + value;
+    current = Math.floor((current - 1) / 26);
+  }
+  return value;
+}
+async function copyDateColumnFormatting(subject, sourceIndex, destinationIndex, insertColumn = false, validationEndRow = 1000) {
+  const metadata = await getSheets().spreadsheets.get({
+    spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
+    fields: 'sheets.properties'
+  });
+  const sheet = metadata.data.sheets.find((entry) => entry.properties.title === subject);
+  if (!sheet) throw new Error(`Subject sheet not found: ${subject}`);
+  const sheetId = sheet.properties.sheetId;
+  await getSheets().spreadsheets.batchUpdate({
+    spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
+    requestBody: {
+      requests: [
+        ...(insertColumn ? [{ insertDimension: { range: { sheetId, dimension: 'COLUMNS', startIndex: destinationIndex, endIndex: destinationIndex + 1 }, inheritFromBefore: false } }] : []),
+        {
+          copyPaste: {
+            source: { sheetId, startRowIndex: 0, endRowIndex: 1000, startColumnIndex: sourceIndex, endColumnIndex: sourceIndex + 1 },
+            destination: { sheetId, startRowIndex: 0, endRowIndex: 1000, startColumnIndex: destinationIndex, endColumnIndex: destinationIndex + 1 },
+            pasteType: 'PASTE_FORMAT'
+          }
+        },
+        {
+          updateDimensionProperties: {
+            range: { sheetId, dimension: 'COLUMNS', startIndex: destinationIndex, endIndex: destinationIndex + 1 },
+            properties: { pixelSize: 100 },
+            fields: 'pixelSize'
+          }
+        },
+        {
+          setBasicFilter: {
+            filter: { range: { sheetId, startRowIndex: 0, endRowIndex: 1000, startColumnIndex: 0, endColumnIndex: 26 } }
+          }
+        },
+        {
+          setDataValidation: {
+            range: { sheetId, startRowIndex: 1, endRowIndex: validationEndRow, startColumnIndex: destinationIndex, endColumnIndex: destinationIndex + 1 },
+            rule: attendanceValidationRule
+          }
+        },
+        ...['Present', 'Absent', 'Late', 'Leave', 'Holiday'].map((status) => ({
+          addConditionalFormatRule: {
+            rule: {
+              ranges: [{ sheetId, startRowIndex: 1, endRowIndex: 1000, startColumnIndex: destinationIndex, endColumnIndex: destinationIndex + 1 }],
+              booleanRule: { condition: { type: 'TEXT_EQ', values: [{ userEnteredValue: status }] }, format: { backgroundColor: status === 'Present' ? { red: 0.86, green: 0.95, blue: 0.88 } : status === 'Absent' ? { red: 0.98, green: 0.88, blue: 0.86 } : status === 'Late' ? { red: 1, green: 0.93, blue: 0.76 } : status === 'Leave' ? { red: 1, green: 0.96, blue: 0.78 } : { red: 0.86, green: 0.92, blue: 0.98 } } }
+            },
+            index: 0
+          }
+        }))
+      ]
+    }
+  });
+}
+async function addAttendanceValidationToRow(subject, rowIndex, dateIndexes) {
+  const metadata = await getSheets().spreadsheets.get({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, fields: 'sheets.properties.title,sheets.properties.sheetId' });
+  const sheet = metadata.data.sheets.find((entry) => entry.properties.title === subject);
+  if (!sheet) return;
+  await getSheets().spreadsheets.batchUpdate({
+    spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
+    requestBody: {
+      requests: dateIndexes.map((dateIndex) => ({
+        setDataValidation: {
+          range: { sheetId: sheet.properties.sheetId, startRowIndex: rowIndex, endRowIndex: rowIndex + 1, startColumnIndex: dateIndex, endColumnIndex: dateIndex + 1 },
+          rule: attendanceValidationRule
+        }
+      }))
+    }
+  });
+}
 async function appendRow(subject, values) {
   await ensureSheetLayout();
-  await getSheets().spreadsheets.values.append({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, range: `'${subject}'!A:I`, valueInputOption: 'USER_ENTERED', insertDataOption: 'INSERT_ROWS', requestBody: { values: [values] } });
+  const result = await getSheets().spreadsheets.values.get({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, range: `'${subject}'!A1:ZZ10000` });
+  const matrix = result.data.values || [['Student ID', 'Student Name', 'Batch']];
+  const header = matrix[0].length >= 3 ? [...matrix[0]] : ['Student ID', 'Student Name', 'Batch'];
+  const date = String(values[0] || '').trim();
+  let dateIndex = header.indexOf(date);
+  const newDateColumn = dateIndex < 3;
+  if (dateIndex < 3) {
+    dateIndex = 3;
+  }
+  const name = normalizeName(values[2]);
+  const batch = String(values[3] || '').trim();
+  const registeredStudent = (await getStudents()).find((entry) => entry.name.toLowerCase() === name.toLowerCase() && entry.batch === batch);
+  const rowIndex = registeredStudent?.id
+    ? matrix.findIndex((row, index) => index > 0 && String(row[0] || '').trim() === registeredStudent.id)
+    : matrix.findIndex((row, index) => index > 0 && normalizeName(row[1]).toLowerCase() === name.toLowerCase() && String(row[2] || '').trim() === batch);
+  const targetRow = rowIndex >= 1 ? rowIndex : matrix.length;
+  if (newDateColumn) {
+    await copyDateColumnFormatting(subject, 4, dateIndex, true, Math.max(matrix.length, targetRow + 1));
+    await getSheets().spreadsheets.values.update({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, range: `'${subject}'!${columnName(dateIndex)}1`, valueInputOption: 'USER_ENTERED', requestBody: { values: [[date]] } });
+  }
+  if (rowIndex < 1) {
+    await getSheets().spreadsheets.values.update({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, range: `'${subject}'!A${targetRow + 1}:C${targetRow + 1}`, valueInputOption: 'USER_ENTERED', requestBody: { values: [[registeredStudent?.id || '', name, batch]] } });
+  }
+  const attendanceUpdates = [{
+    range: `'${subject}'!${columnName(dateIndex)}${targetRow + 1}`,
+    values: [[values[6] || 'Absent']]
+  }];
+  if (rowIndex < 1) {
+    const existingDateIndexes = header.map((value, index) => index >= 3 && /^\d{4}-\d{2}-\d{2}$/.test(String(value || '').trim()) ? index : -1).filter((index) => index >= 0);
+    const validationDateIndexes = [...existingDateIndexes.map((index) => newDateColumn ? index + 1 : index), dateIndex];
+    await addAttendanceValidationToRow(subject, targetRow, [...new Set(validationDateIndexes)]);
+    for (const existingDateIndex of existingDateIndexes) {
+      const existingDate = String(header[existingDateIndex] || '').trim();
+      if (existingDate >= date || existingDate > serverNow().date) continue;
+      attendanceUpdates.push({
+        range: `'${subject}'!${columnName(newDateColumn ? existingDateIndex + 1 : existingDateIndex)}${targetRow + 1}`,
+        values: [[holidays.has(existingDate) ? 'Holiday' : 'Absent']]
+      });
+    }
+  }
+  await getSheets().spreadsheets.values.batchUpdate({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, requestBody: { valueInputOption: 'USER_ENTERED', data: attendanceUpdates } });
 }
 async function readRows(tab) {
   await ensureSheetLayout();
-  const result = await getSheets().spreadsheets.values.get({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, range: `'${tab}'!A1:K10000` });
-  return result.data.values || [];
+  const normalized = String(tab || '').trim();
+  if (!normalized) return [];
+
+  if (normalized === 'Students' || normalized === 'Percentage') return (await getSheets().spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
+    range: `'${normalized}'!A1:K10000`
+  })).data.values || [];
+
+  const result = await getSheets().spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
+    range: `'${normalized}'!A1:ZZ10000`
+  });
+  if (!subjects.includes(normalized)) return result.data.values || [];
+  const matrix = result.data.values || [];
+  const rows = [sheetHeaders];
+  for (const row of matrix.slice(1)) {
+    for (let index = 3; index < (matrix[0] || []).length; index += 1) {
+      if (row[index]) rows.push([matrix[0][index], '', row[1], row[2], courseFor(row[2]), normalized, row[index], 'Matrix', '']);
+    }
+  }
+  return rows;
 }
 async function getStudents() {
   const rows = await readRows('Students');
-  return rows.slice(1).map((r) => ({ name: normalizeName(r[0]), batch: r[1], course: courseFor(r[1]) })).filter((s) => s.name && batches.includes(s.batch));
+  return rows.slice(1).map((r) => ({
+    id: String(r[0] || '').trim(),
+    name: normalizeName(r[1] || r[0]),
+    batch: String(r[2] || r[1] || '').trim(),
+    course: courseFor(String(r[2] || r[1] || '').trim())
+  })).filter((s) => s.name && batches.includes(s.batch));
+}
+async function getSubjectStudents(subject) {
+  const result = await getSheets().spreadsheets.values.get({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, range: `'${subject}'!A1:ZZ10000` });
+  return (result.data.values || []).slice(1).map((row) => ({
+    id: String(row[0] || '').trim(),
+    name: normalizeName(row[1]),
+    batch: String(row[2] || '').trim(),
+    course: courseFor(String(row[2] || '').trim())
+  })).filter((student) => student.name && batches.includes(student.batch));
 }
 async function findExisting(subject, date, name, batch) {
   const rows = await readRows(subject);
-  return rows.slice(1).some((r) => r[0] === date && normalizeName(r[2]).toLowerCase() === name.toLowerCase() && r[3] === batch);
+  return rows.slice(1).some((r) => {
+    const rowDate = String(r[0] || '').trim();
+    const rowName = normalizeName(r[2]);
+    const rowBatch = String(r[3] || '').trim();
+    const rowId = String(r[1] || '').trim();
+    const normalizedName = normalizeName(name);
+    const sameDate = rowDate === date;
+    const sameName = rowName.toLowerCase() === normalizedName.toLowerCase();
+    const sameBatch = rowBatch === batch;
+    const sameStudentId = !!rowId && rowId === batch;
+    return sameDate && sameName && sameBatch && !sameStudentId;
+  });
 }
 async function syncPercentage() {
   const all = [];
@@ -209,15 +427,19 @@ app.post('/api/sessions/:id/close', requireInstructor, async (req, res) => {
   if (session.closedAt) return res.json({ ok: true, added: 0 });
   try {
     const date = serverNow().date;
-    const students = await getStudents();
-    const eligible = students.filter((student) => !session.batch || student.batch === session.batch);
+    const roster = new Map();
+    for (const student of [...await getStudents(), ...await getSubjectStudents(session.subject)]) {
+      if (!session.batch || student.batch === session.batch) roster.set(`${student.name.toLowerCase()}|${student.batch}`, student);
+    }
+    const eligible = [...roster.values()];
     const rows = await readRows(session.subject);
     const existing = new Set(rows.slice(1).filter((r) => r[0] === date && r[3]).map((r) => `${r[2].toLowerCase()}|${r[3]}`));
     let added = 0;
     for (const student of eligible) {
       const key = `${student.name.toLowerCase()}|${student.batch}`;
       if (!existing.has(key)) {
-        await appendRow(session.subject, [date, '-', student.name, student.batch, student.course, session.subject, 'Absent', 'Session close', session.id]);
+        const status = holidays.has(date) ? 'Holiday' : 'Absent';
+        await appendRow(session.subject, [date, status === 'Absent' ? '-' : '', student.name, student.batch, student.course, session.subject, status, 'Session close', session.id]);
         added += 1;
       }
     }
@@ -233,7 +455,7 @@ app.post('/api/attendance', async (req, res) => {
   if (!session) return bad(res, 410, 'This QR code is invalid. Please scan a valid QR code.');
   const name = normalizeName(req.body.name);
   const batch = String(req.body.batch || '');
-  if (!/^[A-Za-z]+(?: [A-Za-z]+)*$/.test(name)) return bad(res, 400, 'Please enter a valid student name using alphabets and spaces only.');
+  if (!/^(?=.{3,}$)[A-Za-z]+(?: [A-Za-z]+)*$/.test(name)) return bad(res, 400, 'Name must contain at least 3 alphabetic characters and spaces only.');
   if (!batches.includes(batch) || (session.batch && session.batch !== batch)) return bad(res, 400, 'Please select a valid batch.');
   const course = courseFor(batch);
   const now = serverNow();
@@ -243,6 +465,57 @@ app.post('/api/attendance', async (req, res) => {
     await syncPercentage();
     res.json({ date: now.date, time: now.time, name, batch, course, subject: session.subject, status: 'Present' });
   } catch (error) { console.error(error); bad(res, 500, "We couldn't save your attendance right now. Please try again."); }
+});
+
+app.get('/api/student-attendance', async (req, res) => {
+  const name = normalizeName(req.query.name);
+  const batch = String(req.query.batch || '').trim();
+  const subject = String(req.query.subject || '').trim();
+  if (!name || !batches.includes(batch) || (subject && !subjects.includes(subject))) return bad(res, 400, 'Please provide a valid student name, batch, and subject.');
+
+  try {
+    const targetSubjects = subject ? [subject] : subjects;
+    const today = serverNow().date;
+    const attendance = [];
+    let student = null;
+    for (const currentSubject of targetSubjects) {
+      const result = await getSheets().spreadsheets.values.get({
+        spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
+        range: `'${currentSubject}'!A1:ZZ10000`
+      });
+      const matrix = result.data.values || [];
+      const header = matrix[0] || [];
+      const row = matrix.slice(1).find((candidate) => normalizeName(candidate[1]).toLowerCase() === name.toLowerCase() && String(candidate[2] || '').trim() === batch);
+      if (!row) continue;
+      student = { id: String(row[0] || '').trim(), name: normalizeName(row[1]), batch };
+      for (let index = 3; index < header.length; index += 1) {
+        const date = String(header[index] || '').trim();
+        const status = String(row[index] || '').trim();
+        if (/^\d{4}-\d{2}-\d{2}$/.test(date) && date <= today && ['Present', 'Absent'].includes(status)) {
+          attendance.push({ date, status, subject: currentSubject });
+        }
+      }
+    }
+    if (!student) return bad(res, 404, 'Student not found. Please check your name and batch.');
+    const presentDays = attendance.filter((record) => record.status === 'Present').length;
+    const totalDays = attendance.length;
+    const percentage = totalDays ? Number(((presentDays / totalDays) * 100).toFixed(2)) : 0;
+    const todayRecords = attendance.filter((record) => record.date === today);
+    const todayStatus = todayRecords.some((record) => record.status === 'Present')
+      ? 'Present'
+      : todayRecords.some((record) => record.status === 'Absent') ? 'Absent' : 'Not Marked';
+    res.json({
+      student,
+      today: { date: today, status: todayStatus },
+      attendance: { presentDays, totalDays, percentage },
+      noRecords: totalDays === 0,
+      lowAttendance: percentage < minAttendancePercentage,
+      minimumRequired: minAttendancePercentage
+    });
+  } catch (error) {
+    console.error(error);
+    bad(res, 500, 'Unable to retrieve attendance right now. Please try again later.');
+  }
 });
 
 app.get('/api/report', requireInstructor, async (req, res) => {
@@ -288,22 +561,25 @@ app.get('/api/percentages', requireInstructor, async (req, res) => {
   } catch (error) { console.error(error); bad(res, 500, 'Unable to calculate attendance percentages.'); }
 });
 app.post('/api/correct', requireInstructor, async (req, res) => {
-  const { subject, name, batch, status } = req.body;
+  const { subject, name, batch, status, date: requestedDate } = req.body;
   const today = serverNow().date;
-  if (!subjects.includes(subject) || !batches.includes(batch) || !['Present', 'Absent'].includes(status)) return bad(res, 400, 'Invalid correction.');
+  const date = String(requestedDate || today).trim();
+  const validDate = /^\d{4}-\d{2}-\d{2}$/.test(date) && !Number.isNaN(Date.parse(`${date}T00:00:00Z`)) && date <= today;
+  if (!subjects.includes(subject) || !batches.includes(batch) || !['Present', 'Absent'].includes(status) || !validDate) return bad(res, 400, 'Choose a valid date up to today.');
   try {
-    const values = await readRows(subject);
-    const rowIndex = values.findIndex((r) => r[0] === today && normalizeName(r[2]).toLowerCase() === normalizeName(name).toLowerCase() && r[3] === batch);
-    const row = [today, status === 'Absent' ? '-' : serverNow().time, normalizeName(name), batch, courseFor(batch), subject, status, 'Instructor correction', 'manual'];
-    if (rowIndex >= 1) {
-      await getSheets().spreadsheets.values.update({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, range: `'${subject}'!A${rowIndex + 1}:I${rowIndex + 1}`, valueInputOption: 'USER_ENTERED', requestBody: { values: [row] } });
-    } else {
-      await appendRow(subject, row);
-    }
+    const row = [date, status === 'Absent' ? '-' : serverNow().time, normalizeName(name), batch, courseFor(batch), subject, status, 'Instructor correction', 'manual'];
+    await appendRow(subject, row);
     await syncPercentage();
-    res.json({ ok: true });
+    res.json({ ok: true, date });
   } catch (error) { console.error(error); bad(res, 500, 'Unable to save the correction.'); }
 });
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 const server = httpsOptions ? https.createServer(httpsOptions, app) : app;
-server.listen(port, '0.0.0.0', () => console.log(`QR attendance running at ${resolvePublicUrl()}`));
+server.listen(port, '0.0.0.0', () => {
+  console.log(`QR attendance running at ${resolvePublicUrl()}`);
+  syncAllSubjectMatrices().catch((error) => console.error('Unable to sync subject matrices:', error.message));
+  syncAttendanceValidation().catch((error) => console.error('Unable to sync attendance selectors:', error.message));
+});
+
+
+// http://192.168.1.10:3000  This is wifi mobile ip address.  You can use this to access the app from your mobile device on the same network.
