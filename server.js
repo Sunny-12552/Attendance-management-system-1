@@ -24,6 +24,7 @@ const courseFor = (batch) => batch.startsWith('P') ? 'Python Full Stack' : batch
 const sheetHeaders = ['Date', 'Time', 'Student Name', 'Batch', 'Course', 'Subject', 'Status', 'Attendance Source', 'Session ID'];
 const sessions = new Map();
 const instructors = new Map();
+const studentRegistrationLocks = new Map();
 const sessionSecret = process.env.SESSION_SECRET || 'development-secret-change-me';
 const qrMinutes = Number(process.env.QR_MINUTES || Number.MAX_SAFE_INTEGER);
 const minAttendancePercentage = Number(process.env.MIN_ATTENDANCE_PERCENTAGE || 75);
@@ -163,6 +164,46 @@ async function syncAllSubjectMatrices() {
   await ensureSheetLayout();
   await Promise.all(subjects.map((subject) => syncSubjectMatrix(subject)));
 }
+async function styleAttendanceSheets() {
+  const metadata = await getSheets().spreadsheets.get({
+    spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
+    fields: 'sheets.properties.title,sheets.properties.sheetId'
+  });
+  const ranges = new Map(metadata.data.sheets.map((entry) => [entry.properties.title, entry.properties.sheetId]));
+  const sheetTitles = [['Students', 3], ...subjects.map((subject) => [subject, 26])];
+  const requests = [];
+  for (const [title, endColumnIndex] of sheetTitles) {
+    const sheetId = ranges.get(title);
+    if (sheetId === undefined) continue;
+    const bodyRange = { sheetId, startRowIndex: 1, endRowIndex: 1000, startColumnIndex: 0, endColumnIndex };
+    requests.push({
+      repeatCell: {
+        range: bodyRange,
+        cell: {
+          userEnteredFormat: {
+            backgroundColor: { red: 1, green: 1, blue: 1 },
+            textFormat: { foregroundColor: { red: 0.09, green: 0.2, blue: 0.2 }, bold: false },
+            verticalAlignment: 'MIDDLE',
+            borders: { bottom: { style: 'SOLID', color: { red: 0.88, green: 0.91, blue: 0.9 } } }
+          }
+        },
+        fields: 'userEnteredFormat(backgroundColor,textFormat,verticalAlignment,borders)'
+      }
+    });
+    requests.push({
+      updateDimensionProperties: {
+        range: { sheetId, dimension: 'ROWS', startIndex: 1, endIndex: 1000 },
+        properties: { pixelSize: 30 },
+        fields: 'pixelSize'
+      }
+    });
+  }
+  if (!requests.length) return;
+  await getSheets().spreadsheets.batchUpdate({
+    spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
+    requestBody: { requests }
+  });
+}
 async function ensureCurrentDateColumn(subject, date = serverNow().date) {
   await ensureSheetLayout();
   const result = await getSheets().spreadsheets.values.get({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, range: `'${subject}'!A1:ZZ10000` });
@@ -301,9 +342,12 @@ async function appendRow(subject, values) {
     await copyDateColumnFormatting(subject, 4, dateIndex, true, Math.max(matrix.length, targetRow + 1));
     await getSheets().spreadsheets.values.update({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, range: `'${subject}'!${columnName(dateIndex)}1`, valueInputOption: 'USER_ENTERED', requestBody: { values: [[date]] } });
   }
-  if (rowIndex < 1) {
-    await getSheets().spreadsheets.values.update({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, range: `'${subject}'!A${targetRow + 1}:C${targetRow + 1}`, valueInputOption: 'USER_ENTERED', requestBody: { values: [[registeredStudent?.id || '', name, batch]] } });
-  }
+  await getSheets().spreadsheets.values.update({
+    spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
+    range: `'${subject}'!A${targetRow + 1}:C${targetRow + 1}`,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: { values: [[registeredStudent?.id || matrix[targetRow]?.[0] || '', name, batch]] }
+  });
   const attendanceUpdates = [{
     range: `'${subject}'!${columnName(dateIndex)}${targetRow + 1}`,
     values: [[values[6] || 'Absent']]
@@ -356,6 +400,37 @@ async function getStudents() {
     course: courseFor(String(r[2] || r[1] || '').trim())
   })).filter((s) => s.name && batches.includes(s.batch));
 }
+async function registerStudent(name, batch) {
+  const normalizedName = normalizeName(name);
+  const key = `${normalizedName.toLowerCase()}|${batch}`;
+  if (studentRegistrationLocks.has(key)) return studentRegistrationLocks.get(key);
+
+  const registration = (async () => {
+    const existing = (await getStudents()).find((student) => student.name.toLowerCase() === normalizedName.toLowerCase() && student.batch === batch);
+    if (existing) return existing;
+
+    await getSheets().spreadsheets.values.append({
+      spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
+      range: 'Students!A:C',
+      valueInputOption: 'USER_ENTERED',
+      insertDataOption: 'INSERT_ROWS',
+      includeValuesInResponse: false,
+      requestBody: {
+        values: [[`=IF(OR(INDEX(B:B,ROW())="",INDEX(C:C,ROW())=""),"","STU-"&TEXT(ROW()-1,"000000"))`, normalizedName, batch]]
+      }
+    });
+
+    const registered = (await getStudents()).find((student) => student.name.toLowerCase() === normalizedName.toLowerCase() && student.batch === batch);
+    if (!registered) throw new Error('Unable to register the student in the Students sheet.');
+    return registered;
+  })();
+  studentRegistrationLocks.set(key, registration);
+  try {
+    return await registration;
+  } finally {
+    studentRegistrationLocks.delete(key);
+  }
+}
 async function getSubjectStudents(subject) {
   const result = await getSheets().spreadsheets.values.get({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, range: `'${subject}'!A1:ZZ10000` });
   return (result.data.values || []).slice(1).map((row) => ({
@@ -364,6 +439,34 @@ async function getSubjectStudents(subject) {
     batch: String(row[2] || '').trim(),
     course: courseFor(String(row[2] || '').trim())
   })).filter((student) => student.name && batches.includes(student.batch));
+}
+async function syncSubjectStudentIds(subject) {
+  const result = await getSheets().spreadsheets.values.get({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, range: `'${subject}'!A1:ZZ10000` });
+  const matrix = result.data.values || [];
+  const updates = [];
+  for (let rowIndex = 1; rowIndex < matrix.length; rowIndex += 1) {
+    const row = matrix[rowIndex];
+    const name = normalizeName(row[1]);
+    const batch = String(row[2] || '').trim();
+    const hasAttendance = row.slice(3).some((value) => String(value || '').trim());
+    if (!name || !batches.includes(batch) || !hasAttendance) continue;
+    const student = await registerStudent(name, batch);
+    if (student.id && student.id !== String(row[0] || '').trim()) {
+      updates.push({
+        range: `'${subject}'!A${rowIndex + 1}`,
+        values: [[student.id]]
+      });
+    }
+  }
+  if (updates.length) {
+    await getSheets().spreadsheets.values.batchUpdate({
+      spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
+      requestBody: { valueInputOption: 'USER_ENTERED', data: updates }
+    });
+  }
+}
+async function syncAllSubjectStudentIds() {
+  await Promise.all(subjects.map((subject) => syncSubjectStudentIds(subject)));
 }
 async function findExisting(subject, date, name, batch) {
   const rows = await readRows(subject);
@@ -488,6 +591,7 @@ app.post('/api/attendance', async (req, res) => {
   const now = serverNow();
   try {
     if (await findExisting(session.subject, now.date, name, batch)) return bad(res, 409, 'Your attendance for this subject has already been marked today.');
+    await registerStudent(name, batch);
     await appendRow(session.subject, [now.date, now.time, name, batch, course, session.subject, 'Present', 'QR', session.id]);
     await syncPercentage();
     res.json({ date: now.date, time: now.time, name, batch, course, subject: session.subject, status: 'Present' });
@@ -605,6 +709,8 @@ const server = httpsOptions ? https.createServer(httpsOptions, app) : app;
 server.listen(port, '0.0.0.0', () => {
   console.log(`QR attendance running at ${resolvePublicUrl()}`);
   syncAllSubjectMatrices()
+    .then(() => styleAttendanceSheets())
+    .then(() => syncAllSubjectStudentIds())
     .then(() => ensureCurrentDateColumns())
     .catch((error) => console.error('Unable to sync subject matrices:', error.message));
   syncAttendanceValidation().catch((error) => console.error('Unable to sync attendance selectors:', error.message));

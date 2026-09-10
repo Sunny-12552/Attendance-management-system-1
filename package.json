@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node server.js",
     "start:clean": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-clean.ps1",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "migrate:sheet": "node scripts/copy-spreadsheet.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
