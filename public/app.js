@@ -3,6 +3,7 @@ const params = new URLSearchParams(location.search);
 const token = params.get('session');
 let config = { subjects: [], batches: [] };
 let records = [];
+let dashboardDate = '';
 
 async function api(path, options = {}) {
   const response = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...options });
@@ -48,7 +49,12 @@ function buildDateGroupedRecords(rows) {
   }
   return [...grouped.entries()].sort(([a], [b]) => new Date(`${b}T00:00:00`) - new Date(`${a}T00:00:00`));
 }
-async function refreshReport() { try { records = await api('/api/report'); const percentages = await api('/api/percentages'); const date = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date()); const today = records.filter((r) => r.date === date); $('total-count').textContent = today.length; $('present-count').textContent = today.filter((r) => r.status === 'Present').length; $('absent-count').textContent = today.filter((r) => r.status === 'Absent').length; const groupedRecords = buildDateGroupedRecords(records.slice().reverse()); $('records').innerHTML = groupedRecords.length ? groupedRecords.map(([day, dayRows]) => `
+function getServerDate() { return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date()); }
+function updateDashboardDate(date) {
+  dashboardDate = date;
+  $('dashboard-date').textContent = new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Kolkata', dateStyle: 'full' }).format(new Date(`${date}T00:00:00`));
+}
+async function refreshReport() { try { records = await api('/api/report'); const percentages = await api('/api/percentages'); const date = getServerDate(); updateDashboardDate(date); const today = records.filter((r) => r.date === date); $('total-count').textContent = today.length; $('present-count').textContent = today.filter((r) => r.status === 'Present').length; $('absent-count').textContent = today.filter((r) => r.status === 'Absent').length; const groupedRecords = buildDateGroupedRecords(records.slice().reverse()); $('records').innerHTML = groupedRecords.length ? groupedRecords.map(([day, dayRows]) => `
         <tr class="date-group-row"><td colspan="5"><div class="date-group-header">${escapeHtml(formatReportDate(day))}</div></td></tr>
         ${dayRows.map((r) => `<tr><td>${escapeHtml(r.date)}</td><td>${escapeHtml(r.name)}</td><td>${escapeHtml(r.batch)}</td><td>${escapeHtml(r.subject)}</td><td class="status ${r.status.toLowerCase()}">${escapeHtml(r.status)}</td></tr>`).join('')}
       `).join('') : '<tr><td colspan="5">No records yet.</td></tr>';
@@ -69,4 +75,7 @@ $('refresh-records').addEventListener('click', refreshReport);
 $('refresh-percentages').addEventListener('click', refreshReport);
 $('correction-form').addEventListener('submit', async (event) => { event.preventDefault(); message('correction-message', 'Saving...'); try { const date = $('correction-date').value; await api('/api/correct', { method: 'POST', body: JSON.stringify({ name: $('correction-name').value, batch: $('correction-batch').value, subject: $('correction-subject').value, status: $('correction-status').value, date: date || undefined }) }); message('correction-message', date ? `Correction saved for ${date}.` : 'Today\'s correction saved.'); await refreshReport(); } catch (error) { message('correction-message', error.message); } });
 async function initDashboard() { show('dashboard-view'); $('logout').classList.remove('hidden'); await refreshReport(); }
+setInterval(() => {
+  if (!$('dashboard-view').classList.contains('hidden') && dashboardDate && getServerDate() !== dashboardDate) refreshReport();
+}, 30000);
 (async function boot() { await loadConfig(); if (token) return initStudent(); const me = await api('/api/me'); if (me.instructor) return initDashboard(); show('login-view'); })().catch((error) => { show('login-view'); message('login-message', error.message); });

@@ -163,6 +163,25 @@ async function syncAllSubjectMatrices() {
   await ensureSheetLayout();
   await Promise.all(subjects.map((subject) => syncSubjectMatrix(subject)));
 }
+async function ensureCurrentDateColumn(subject, date = serverNow().date) {
+  await ensureSheetLayout();
+  const result = await getSheets().spreadsheets.values.get({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, range: `'${subject}'!A1:ZZ10000` });
+  const matrix = result.data.values || [['Student ID', 'Student Name', 'Batch']];
+  const header = matrix[0] || [];
+  if (header.slice(3).some((value) => String(value || '').trim() === date)) return;
+
+  const dateColumnIndex = 3;
+  await copyDateColumnFormatting(subject, Math.min(4, Math.max(3, header.length - 1)), dateColumnIndex, true, Math.max(matrix.length, 1000));
+  await getSheets().spreadsheets.values.update({
+    spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
+    range: `'${subject}'!${columnName(dateColumnIndex)}1`,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: { values: [[date]] }
+  });
+}
+async function ensureCurrentDateColumns(date = serverNow().date) {
+  await Promise.all(subjects.map((subject) => ensureCurrentDateColumn(subject, date)));
+}
 async function syncAttendanceValidation() {
   const metadata = await getSheets().spreadsheets.get({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, fields: 'sheets.properties.title,sheets.properties.sheetId' });
   const requests = [];
@@ -585,9 +604,19 @@ app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.ht
 const server = httpsOptions ? https.createServer(httpsOptions, app) : app;
 server.listen(port, '0.0.0.0', () => {
   console.log(`QR attendance running at ${resolvePublicUrl()}`);
-  syncAllSubjectMatrices().catch((error) => console.error('Unable to sync subject matrices:', error.message));
+  syncAllSubjectMatrices()
+    .then(() => ensureCurrentDateColumns())
+    .catch((error) => console.error('Unable to sync subject matrices:', error.message));
   syncAttendanceValidation().catch((error) => console.error('Unable to sync attendance selectors:', error.message));
 });
+
+let sheetDate = serverNow().date;
+setInterval(() => {
+  const currentDate = serverNow().date;
+  if (currentDate === sheetDate) return;
+  sheetDate = currentDate;
+  ensureCurrentDateColumns(currentDate).catch((error) => console.error('Unable to add new date columns:', error.message));
+}, 60000);
 
 
 // http://192.168.1.10:3000  This is wifi mobile ip address.  You can use this to access the app from your mobile device on the same network.
