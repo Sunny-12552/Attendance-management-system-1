@@ -28,7 +28,40 @@ $('student-attendance-form').addEventListener('submit', async (event) => { event
 $('login-form').addEventListener('submit', async (event) => { event.preventDefault(); message('login-message', 'Opening...'); try { await api('/api/login', { method: 'POST', body: JSON.stringify({ password: $('password').value }) }); await initDashboard(); } catch (error) { message('login-message', error.message); } });
 $('logout').addEventListener('click', async () => { await api('/api/logout', { method: 'POST' }); $('logout').classList.add('hidden'); show('login-view'); });
 $('session-form').addEventListener('submit', async (event) => { event.preventDefault(); message('session-message', 'Generating...'); try { const session = await api('/api/sessions', { method: 'POST', body: JSON.stringify({ subject: $('subject').value, batch: $('scope-batch').value }) }); $('qr-result').classList.remove('hidden'); $('qr-result').innerHTML = `<img src="${session.qr}" alt="Attendance QR code"><p><a href="${session.url}" target="_blank">Open student page ↗</a></p><button class="secondary" id="close-session" type="button">Close session and mark absences</button>`; $('close-session').addEventListener('click', async () => { $('close-session').disabled = true; $('close-session').textContent = 'Finalizing...'; try { const result = await api(`/api/sessions/${session.id}/close`, { method: 'POST' }); $('close-session').textContent = `Closed · ${result.added} absences added`; await refreshReport(); } catch (error) { $('close-session').disabled = false; $('close-session').textContent = error.message; } }); message('session-message'); } catch (error) { message('session-message', error.message); } });
-async function refreshReport() { try { records = await api('/api/report'); const percentages = await api('/api/percentages'); const date = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date()); const today = records.filter((r) => r.date === date); $('total-count').textContent = today.length; $('present-count').textContent = today.filter((r) => r.status === 'Present').length; $('absent-count').textContent = today.filter((r) => r.status === 'Absent').length; $('records').innerHTML = records.slice(-50).reverse().map((r) => `<tr><td>${escapeHtml(r.date)}</td><td>${escapeHtml(r.name)}</td><td>${escapeHtml(r.batch)}</td><td>${escapeHtml(r.subject)}</td><td class="status ${r.status.toLowerCase()}">${escapeHtml(r.status)}</td></tr>`).join('') || '<tr><td colspan="5">No records yet.</td></tr>'; $('percentages').innerHTML = percentages.filter((r) => r.total > 0).map((r) => `<tr><td>${escapeHtml(r.name)}</td><td>${escapeHtml(r.batch)}</td><td>${escapeHtml(r.subject)}</td><td>${r.attended}</td><td>${r.total}</td><td class="status">${r.subjectPercentage}%</td><td class="status">${r.overallPercentage}%</td></tr>`).join('') || '<tr><td colspan="7">No conducted classes yet.</td></tr>'; } catch (error) { message('session-message', error.message); } }
+function formatReportDate(date) {
+  if (!date) return 'Unknown date';
+  const safeDate = new Date(`${date}T00:00:00`);
+  return new Intl.DateTimeFormat('en-GB', { day: '2-digit', month: 'short', year: 'numeric', timeZone: 'Asia/Kolkata' }).format(safeDate);
+}
+function formatSectionLabel(batch) {
+  if (!batch) return 'General';
+  const prefix = batch.charAt(0).toUpperCase();
+  const map = { P: 'P - Python', J: 'J - Java', D: 'D - Data Science' };
+  return map[prefix] || `${prefix} - ${batch}`;
+}
+function buildDateGroupedRecords(rows) {
+  const grouped = new Map();
+  for (const row of rows) {
+    const key = row.date || 'Unknown date';
+    if (!grouped.has(key)) grouped.set(key, []);
+    grouped.get(key).push(row);
+  }
+  return [...grouped.entries()].sort(([a], [b]) => new Date(`${b}T00:00:00`) - new Date(`${a}T00:00:00`));
+}
+async function refreshReport() { try { records = await api('/api/report'); const percentages = await api('/api/percentages'); const date = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date()); const today = records.filter((r) => r.date === date); $('total-count').textContent = today.length; $('present-count').textContent = today.filter((r) => r.status === 'Present').length; $('absent-count').textContent = today.filter((r) => r.status === 'Absent').length; const groupedRecords = buildDateGroupedRecords(records.slice().reverse()); $('records').innerHTML = groupedRecords.length ? groupedRecords.map(([day, dayRows]) => `
+        <tr class="date-group-row"><td colspan="5"><div class="date-group-header">${escapeHtml(formatReportDate(day))}</div></td></tr>
+        ${dayRows.map((r) => `<tr><td>${escapeHtml(r.date)}</td><td>${escapeHtml(r.name)}</td><td>${escapeHtml(r.batch)}</td><td>${escapeHtml(r.subject)}</td><td class="status ${r.status.toLowerCase()}">${escapeHtml(r.status)}</td></tr>`).join('')}
+      `).join('') : '<tr><td colspan="5">No records yet.</td></tr>';
+    const groupedPercentages = new Map();
+    for (const row of percentages.filter((r) => r.total > 0)) {
+      const label = formatSectionLabel(row.batch);
+      if (!groupedPercentages.has(label)) groupedPercentages.set(label, []);
+      groupedPercentages.get(label).push(row);
+    }
+    $('percentages').innerHTML = groupedPercentages.size ? [...groupedPercentages.entries()].map(([sectionLabel, sectionRows]) => `
+        <tr class="section-group-row"><td colspan="7"><div class="section-group-header">${escapeHtml(sectionLabel)}</div></td></tr>
+        ${sectionRows.map((r) => `<tr><td>${escapeHtml(r.name)}</td><td>${escapeHtml(r.batch)}</td><td>${escapeHtml(r.subject)}</td><td>${r.attended}</td><td>${r.total}</td><td class="status">${r.subjectPercentage}%</td><td class="status">${r.overallPercentage}%</td></tr>`).join('')}
+      `).join('') : '<tr><td colspan="7">No conducted classes yet.</td></tr>'; } catch (error) { message('session-message', error.message); } }
 $('open-records').addEventListener('click', async () => { show('records-view'); await refreshReport(); });
 $('open-percentages').addEventListener('click', async () => { show('percentage-view'); await refreshReport(); });
 document.querySelectorAll('.back-dashboard').forEach((button) => button.addEventListener('click', () => show('dashboard-view')));

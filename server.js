@@ -370,7 +370,7 @@ async function syncPercentage() {
   const identities = new Map();
   const classDates = new Map();
   for (const row of all) {
-    if (!row.name || !row.batch || !row.date) continue;
+    if (!row.name || !row.batch || !row.date || row.status === 'Holiday') continue;
     const identity = `${row.name.toLowerCase()}|${row.batch}|${row.subject}`;
     if (!identities.has(identity)) identities.set(identity, { name: row.name, batch: row.batch, course: row.course, subject: row.subject, attended: 0 });
     if (row.status === 'Present') identities.get(identity).attended += 1;
@@ -554,8 +554,8 @@ app.get('/api/percentages', requireInstructor, async (req, res) => {
     const overall = new Map();
     for (const student of reportStudents) {
       for (const subject of subjects) {
-        const subjectRows = rows.filter((row) => row.name.toLowerCase() === student.name.toLowerCase() && row.batch === student.batch && row.subject === subject);
-        const dates = new Set(rows.filter((row) => row.batch === student.batch && row.subject === subject && row.date).map((row) => row.date));
+        const subjectRows = rows.filter((row) => row.name.toLowerCase() === student.name.toLowerCase() && row.batch === student.batch && row.subject === subject && row.status !== 'Holiday');
+        const dates = new Set(rows.filter((row) => row.batch === student.batch && row.subject === subject && row.date && row.status !== 'Holiday').map((row) => row.date));
         const attended = subjectRows.filter((row) => row.status === 'Present').length;
         const total = dates.size;
         const key = `${student.name.toLowerCase()}|${student.batch}`;
