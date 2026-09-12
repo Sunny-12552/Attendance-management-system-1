@@ -33,7 +33,7 @@ const qrMinutes = Number(process.env.QR_MINUTES || Number.MAX_SAFE_INTEGER);
 const minAttendancePercentage = Number(process.env.MIN_ATTENDANCE_PERCENTAGE || 75);
 const attendanceValidationRule = { condition: { type: 'ONE_OF_LIST', values: [{ userEnteredValue: 'Present' }, { userEnteredValue: 'Absent' }, { userEnteredValue: 'Holiday' }] }, showCustomUi: true, strict: false };
 const holidays = new Set((process.env.HOLIDAYS || '').split(',').map((date) => date.trim()).filter((date) => /^\d{4}-\d{2}-\d{2}$/.test(date)));
-const deviceLockMessage = 'Attendance Already Marked. This device has already been used to mark attendance today. You cannot mark another student’s attendance from this device.';
+const deviceLockMessage = 'Attendance Limit Reached. This device has already marked attendance for this subject.';
 const deviceTokenPattern = /^[A-Za-z0-9._:-]{12,128}$/;
 
 function ledgerSheetName(subject) { return `${subject} Ledger`; }
@@ -68,8 +68,8 @@ function hashDeviceToken(deviceToken) {
 function isValidDeviceToken(deviceToken) {
   return typeof deviceToken === 'string' && deviceTokenPattern.test(deviceToken.trim());
 }
-function getDeviceLockKey(date, deviceToken) {
-  return `${String(date || '').trim()}|${hashDeviceToken(deviceToken)}`;
+function getDeviceLockKey(date, deviceToken, qrSessionId) {
+  return `${String(date || '').trim()}|${String(qrSessionId || '').trim()}|${hashDeviceToken(deviceToken)}`;
 }
 async function loadDeviceLocksFromDisk() {
   try {
@@ -77,7 +77,11 @@ async function loadDeviceLocksFromDisk() {
     const parsed = JSON.parse(raw || '{}');
     for (const [key, value] of Object.entries(parsed || {})) {
       if (!value || typeof value !== 'object') continue;
-      deviceAttendanceLocks.set(key, { ...value, deviceTokenHash: value.deviceTokenHash || key.split('|')[1] || '' });
+      const parts = key.split('|');
+      const qrSessionId = String(value.qrSessionId || parts[1] || '').trim();
+      const deviceTokenHash = value.deviceTokenHash || parts[2] || '';
+      if (!qrSessionId || !deviceTokenHash) continue;
+      deviceAttendanceLocks.set(key, { ...value, qrSessionId, deviceTokenHash });
     }
   } catch (error) {
     if (error.code !== 'ENOENT') console.warn('Unable to read device-lock store:', error.message);
@@ -86,16 +90,16 @@ async function loadDeviceLocksFromDisk() {
 async function persistDeviceLocks() {
   await fs.promises.writeFile(DEVICE_LOCKS_PATH, JSON.stringify(Object.fromEntries(deviceAttendanceLocks), null, 2), 'utf8');
 }
-async function isDeviceDailyAttendanceLocked(date, deviceToken) {
+async function isDeviceSessionAttendanceLocked(date, deviceToken, qrSessionId) {
   if (!isValidDeviceToken(deviceToken)) return true;
-  return deviceAttendanceLocks.has(getDeviceLockKey(date, deviceToken));
+  return deviceAttendanceLocks.has(getDeviceLockKey(date, deviceToken, qrSessionId));
 }
-async function claimDeviceDailyAttendanceLock({ date, deviceToken, studentIdentifier }) {
+async function claimDeviceSessionAttendanceLock({ date, deviceToken, qrSessionId, subject, studentIdentifier }) {
   if (!isValidDeviceToken(deviceToken)) {
     return { allowed: false, reason: 'Unable to identify this device. Please refresh the page and try again.' };
   }
 
-  const key = getDeviceLockKey(date, deviceToken);
+  const key = getDeviceLockKey(date, deviceToken, qrSessionId);
   const pending = activeDeviceLockClaims.get(key);
   if (pending) {
     await pending;
@@ -106,7 +110,7 @@ async function claimDeviceDailyAttendanceLock({ date, deviceToken, studentIdenti
     if (deviceAttendanceLocks.has(key)) {
       return { allowed: false, reason: deviceLockMessage };
     }
-    const record = { date: String(date || '').trim(), deviceTokenHash: hashDeviceToken(deviceToken), studentIdentifier: String(studentIdentifier || '').trim(), createdAt: Date.now() };
+    const record = { date: String(date || '').trim(), qrSessionId: String(qrSessionId || '').trim(), subject: normalizeSubjectName(subject), deviceTokenHash: hashDeviceToken(deviceToken), studentIdentifier: String(studentIdentifier || '').trim(), createdAt: Date.now() };
     deviceAttendanceLocks.set(key, record);
     await persistDeviceLocks();
     return { allowed: true, record };
@@ -119,9 +123,9 @@ async function claimDeviceDailyAttendanceLock({ date, deviceToken, studentIdenti
     activeDeviceLockClaims.delete(key);
   }
 }
-async function releaseDeviceDailyAttendanceLock(date, deviceToken) {
+async function releaseDeviceSessionAttendanceLock(date, deviceToken, qrSessionId) {
   if (!isValidDeviceToken(deviceToken)) return false;
-  const key = getDeviceLockKey(date, deviceToken);
+  const key = getDeviceLockKey(date, deviceToken, qrSessionId);
   if (!deviceAttendanceLocks.has(key)) return false;
   deviceAttendanceLocks.delete(key);
   await persistDeviceLocks();
@@ -177,6 +181,9 @@ function readSession(token) {
   if (dot < 1 || token.slice(dot + 1) !== sign(id)) return null;
   const session = sessions.get(id);
   return session ? session : null;
+}
+function isSessionActive(session) {
+  return !!session && session.status === 'active' && session.expiresAt > Date.now();
 }
 function bad(res, status, error) { return res.status(status).json({ error }); }
 
@@ -246,7 +253,7 @@ async function syncSubjectMatrix(subject) {
 }
 async function syncAllSubjectMatrices() {
   await ensureSheetLayout();
-  await Promise.all(subjects.map((subject) => syncSubjectMatrix(subject)));
+  for (const subject of subjects) await syncSubjectMatrix(subject);
 }
 async function styleAttendanceSheets() {
   const metadata = await getSheets().spreadsheets.get({
@@ -306,7 +313,7 @@ async function ensureCurrentDateColumn(subject, date = serverNow().date) {
   });
 }
 async function ensureCurrentDateColumns(date = serverNow().date) {
-  await Promise.all(subjects.map((subject) => ensureCurrentDateColumn(subject, date)));
+  for (const subject of subjects) await ensureCurrentDateColumn(subject, date);
 }
 async function fillMissingDateAbsences(subject, date = serverNow().date) {
   const targetSheet = resolveSubjectSheetTitle(subject);
@@ -583,7 +590,7 @@ async function syncSubjectStudentIds(subject) {
   }
 }
 async function syncAllSubjectStudentIds() {
-  await Promise.all(subjects.map((subject) => syncSubjectStudentIds(subject)));
+  for (const subject of subjects) await syncSubjectStudentIds(subject);
 }
 async function findExisting(subject, date, name, batch) {
   const rows = await readRows(subject);
@@ -665,7 +672,7 @@ app.post('/api/sessions', requireInstructor, async (req, res) => {
 });
 app.get('/api/sessions/:token', (req, res) => {
   const session = readSession(req.params.token);
-  if (!session) return bad(res, 410, 'This QR code is invalid. Please scan a valid QR code.');
+  if (!isSessionActive(session)) return bad(res, 410, 'This QR code is invalid or expired. Please scan a valid QR code.');
   res.json({ subject: session.subject, batch: session.batch, expiresAt: session.expiresAt, valid: true });
 });
 app.post('/api/sessions/:id/close', requireInstructor, async (req, res) => {
@@ -699,7 +706,7 @@ app.post('/api/sessions/:id/close', requireInstructor, async (req, res) => {
 
 app.post('/api/attendance', async (req, res) => {
   const session = readSession(req.body.token);
-  if (!session) return bad(res, 410, 'This QR code is invalid. Please scan a valid QR code.');
+  if (!isSessionActive(session)) return bad(res, 410, 'This QR code is invalid or expired. Please scan a valid QR code.');
   const name = normalizeName(req.body.name);
   const batch = String(req.body.batch || '');
   const deviceToken = String(req.body.deviceToken || '').trim();
@@ -708,11 +715,11 @@ app.post('/api/attendance', async (req, res) => {
   if (!isValidDeviceToken(deviceToken)) return bad(res, 400, 'Unable to identify this device. Please refresh the page and try again.');
   const course = courseFor(batch);
   const now = serverNow();
-  if (await isDeviceDailyAttendanceLocked(now.date, deviceToken)) return bad(res, 409, deviceLockMessage);
+  if (await isDeviceSessionAttendanceLocked(now.date, deviceToken, session.id)) return bad(res, 409, deviceLockMessage);
   let lockGranted = false;
   try {
     if (await findExisting(session.subject, now.date, name, batch)) return bad(res, 409, 'Your attendance for this subject has already been marked today.');
-    const lock = await claimDeviceDailyAttendanceLock({ date: now.date, deviceToken, studentIdentifier: `${name}|${batch}` });
+    const lock = await claimDeviceSessionAttendanceLock({ date: now.date, deviceToken, qrSessionId: session.id, subject: session.subject, studentIdentifier: `${name}|${batch}` });
     if (!lock.allowed) return bad(res, 409, lock.reason);
     lockGranted = true;
     await registerStudent(name, batch);
@@ -720,7 +727,7 @@ app.post('/api/attendance', async (req, res) => {
     await syncPercentage();
     res.json({ date: now.date, time: now.time, name, batch, course, subject: session.subject, status: 'Present' });
   } catch (error) {
-    if (lockGranted) await releaseDeviceDailyAttendanceLock(now.date, deviceToken);
+    if (lockGranted) await releaseDeviceSessionAttendanceLock(now.date, deviceToken, session.id);
     console.error(error);
     bad(res, 500, "We couldn't save your attendance right now. Please try again.");
   }
@@ -844,17 +851,17 @@ if (isDirectExecution) {
       .then(() => styleAttendanceSheets())
       .then(() => syncAllSubjectStudentIds())
       .then(() => ensureCurrentDateColumns())
+      .then(() => syncAttendanceValidation())
       .catch((error) => console.error('Unable to sync subject matrices:', error.message));
-    syncAttendanceValidation().catch((error) => console.error('Unable to sync attendance selectors:', error.message));
   });
 }
 
 export {
   hashDeviceToken,
   isValidDeviceToken,
-  isDeviceDailyAttendanceLocked,
-  claimDeviceDailyAttendanceLock,
-  releaseDeviceDailyAttendanceLock,
+  isDeviceSessionAttendanceLocked,
+  claimDeviceSessionAttendanceLock,
+  releaseDeviceSessionAttendanceLock,
   loadDeviceLocksFromDisk,
   persistDeviceLocks
 };
@@ -870,4 +877,6 @@ setInterval(() => {
 }, 60000);
 
 
-// http://192.168.1.10:3000  This is wifi mobile ip address.  You can use this to access the app from your mobile device on the same network.
+
+
+
