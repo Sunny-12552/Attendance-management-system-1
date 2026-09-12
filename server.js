@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import https from 'node:https';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import QRCode from 'qrcode';
 import { google } from 'googleapis';
 
@@ -25,11 +25,16 @@ const sheetHeaders = ['Date', 'Time', 'Student Name', 'Batch', 'Course', 'Subjec
 const sessions = new Map();
 const instructors = new Map();
 const studentRegistrationLocks = new Map();
+const deviceAttendanceLocks = new Map();
+const activeDeviceLockClaims = new Map();
+const DEVICE_LOCKS_PATH = path.join(__dirname, '.device-locks.json');
 const sessionSecret = process.env.SESSION_SECRET || 'development-secret-change-me';
 const qrMinutes = Number(process.env.QR_MINUTES || Number.MAX_SAFE_INTEGER);
 const minAttendancePercentage = Number(process.env.MIN_ATTENDANCE_PERCENTAGE || 75);
 const attendanceValidationRule = { condition: { type: 'ONE_OF_LIST', values: [{ userEnteredValue: 'Present' }, { userEnteredValue: 'Absent' }, { userEnteredValue: 'Holiday' }] }, showCustomUi: true, strict: false };
 const holidays = new Set((process.env.HOLIDAYS || '').split(',').map((date) => date.trim()).filter((date) => /^\d{4}-\d{2}-\d{2}$/.test(date)));
+const deviceLockMessage = 'Attendance Already Marked. This device has already been used to mark attendance today. You cannot mark another student’s attendance from this device.';
+const deviceTokenPattern = /^[A-Za-z0-9._:-]{12,128}$/;
 
 function ledgerSheetName(subject) { return `${subject} Ledger`; }
 
@@ -56,6 +61,71 @@ app.enable('trust proxy');
 
 function sign(value) {
   return crypto.createHmac('sha256', sessionSecret).update(value).digest('hex');
+}
+function hashDeviceToken(deviceToken) {
+  return crypto.createHash('sha256').update(String(deviceToken).trim() + sessionSecret).digest('hex');
+}
+function isValidDeviceToken(deviceToken) {
+  return typeof deviceToken === 'string' && deviceTokenPattern.test(deviceToken.trim());
+}
+function getDeviceLockKey(date, deviceToken) {
+  return `${String(date || '').trim()}|${hashDeviceToken(deviceToken)}`;
+}
+async function loadDeviceLocksFromDisk() {
+  try {
+    const raw = await fs.promises.readFile(DEVICE_LOCKS_PATH, 'utf8');
+    const parsed = JSON.parse(raw || '{}');
+    for (const [key, value] of Object.entries(parsed || {})) {
+      if (!value || typeof value !== 'object') continue;
+      deviceAttendanceLocks.set(key, { ...value, deviceTokenHash: value.deviceTokenHash || key.split('|')[1] || '' });
+    }
+  } catch (error) {
+    if (error.code !== 'ENOENT') console.warn('Unable to read device-lock store:', error.message);
+  }
+}
+async function persistDeviceLocks() {
+  await fs.promises.writeFile(DEVICE_LOCKS_PATH, JSON.stringify(Object.fromEntries(deviceAttendanceLocks), null, 2), 'utf8');
+}
+async function isDeviceDailyAttendanceLocked(date, deviceToken) {
+  if (!isValidDeviceToken(deviceToken)) return true;
+  return deviceAttendanceLocks.has(getDeviceLockKey(date, deviceToken));
+}
+async function claimDeviceDailyAttendanceLock({ date, deviceToken, studentIdentifier }) {
+  if (!isValidDeviceToken(deviceToken)) {
+    return { allowed: false, reason: 'Unable to identify this device. Please refresh the page and try again.' };
+  }
+
+  const key = getDeviceLockKey(date, deviceToken);
+  const pending = activeDeviceLockClaims.get(key);
+  if (pending) {
+    await pending;
+    return { allowed: false, reason: deviceLockMessage };
+  }
+
+  const attempt = (async () => {
+    if (deviceAttendanceLocks.has(key)) {
+      return { allowed: false, reason: deviceLockMessage };
+    }
+    const record = { date: String(date || '').trim(), deviceTokenHash: hashDeviceToken(deviceToken), studentIdentifier: String(studentIdentifier || '').trim(), createdAt: Date.now() };
+    deviceAttendanceLocks.set(key, record);
+    await persistDeviceLocks();
+    return { allowed: true, record };
+  })();
+
+  activeDeviceLockClaims.set(key, attempt);
+  try {
+    return await attempt;
+  } finally {
+    activeDeviceLockClaims.delete(key);
+  }
+}
+async function releaseDeviceDailyAttendanceLock(date, deviceToken) {
+  if (!isValidDeviceToken(deviceToken)) return false;
+  const key = getDeviceLockKey(date, deviceToken);
+  if (!deviceAttendanceLocks.has(key)) return false;
+  deviceAttendanceLocks.delete(key);
+  await persistDeviceLocks();
+  return true;
 }
 function instructorCookie() {
   const value = `${Date.now()}.${crypto.randomBytes(16).toString('hex')}`;
@@ -585,17 +655,28 @@ app.post('/api/attendance', async (req, res) => {
   if (!session) return bad(res, 410, 'This QR code is invalid. Please scan a valid QR code.');
   const name = normalizeName(req.body.name);
   const batch = String(req.body.batch || '');
+  const deviceToken = String(req.body.deviceToken || '').trim();
   if (!/^(?=.{3,}$)[A-Za-z]+(?: [A-Za-z]+)*$/.test(name)) return bad(res, 400, 'Name must contain at least 3 alphabetic characters and spaces only.');
   if (!batches.includes(batch) || (session.batch && session.batch !== batch)) return bad(res, 400, 'Please select a valid batch.');
+  if (!isValidDeviceToken(deviceToken)) return bad(res, 400, 'Unable to identify this device. Please refresh the page and try again.');
   const course = courseFor(batch);
   const now = serverNow();
+  if (await isDeviceDailyAttendanceLocked(now.date, deviceToken)) return bad(res, 409, deviceLockMessage);
+  let lockGranted = false;
   try {
     if (await findExisting(session.subject, now.date, name, batch)) return bad(res, 409, 'Your attendance for this subject has already been marked today.');
+    const lock = await claimDeviceDailyAttendanceLock({ date: now.date, deviceToken, studentIdentifier: `${name}|${batch}` });
+    if (!lock.allowed) return bad(res, 409, lock.reason);
+    lockGranted = true;
     await registerStudent(name, batch);
     await appendRow(session.subject, [now.date, now.time, name, batch, course, session.subject, 'Present', 'QR', session.id]);
     await syncPercentage();
     res.json({ date: now.date, time: now.time, name, batch, course, subject: session.subject, status: 'Present' });
-  } catch (error) { console.error(error); bad(res, 500, "We couldn't save your attendance right now. Please try again."); }
+  } catch (error) {
+    if (lockGranted) await releaseDeviceDailyAttendanceLock(now.date, deviceToken);
+    console.error(error);
+    bad(res, 500, "We couldn't save your attendance right now. Please try again.");
+  }
 });
 
 app.get('/api/student-attendance', async (req, res) => {
@@ -705,16 +786,30 @@ app.post('/api/correct', requireInstructor, async (req, res) => {
   } catch (error) { console.error(error); bad(res, 500, 'Unable to save the correction.'); }
 });
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
-const server = httpsOptions ? https.createServer(httpsOptions, app) : app;
-server.listen(port, '0.0.0.0', () => {
-  console.log(`QR attendance running at ${resolvePublicUrl()}`);
-  syncAllSubjectMatrices()
-    .then(() => styleAttendanceSheets())
-    .then(() => syncAllSubjectStudentIds())
-    .then(() => ensureCurrentDateColumns())
-    .catch((error) => console.error('Unable to sync subject matrices:', error.message));
-  syncAttendanceValidation().catch((error) => console.error('Unable to sync attendance selectors:', error.message));
-});
+const isDirectExecution = process.argv[1] ? import.meta.url === pathToFileURL(process.argv[1]).href : false;
+if (isDirectExecution) {
+  loadDeviceLocksFromDisk().catch((error) => console.warn('Unable to load device locks:', error.message));
+  const server = httpsOptions ? https.createServer(httpsOptions, app) : app;
+  server.listen(port, '0.0.0.0', () => {
+    console.log(`QR attendance running at ${resolvePublicUrl()}`);
+    syncAllSubjectMatrices()
+      .then(() => styleAttendanceSheets())
+      .then(() => syncAllSubjectStudentIds())
+      .then(() => ensureCurrentDateColumns())
+      .catch((error) => console.error('Unable to sync subject matrices:', error.message));
+    syncAttendanceValidation().catch((error) => console.error('Unable to sync attendance selectors:', error.message));
+  });
+}
+
+export {
+  hashDeviceToken,
+  isValidDeviceToken,
+  isDeviceDailyAttendanceLocked,
+  claimDeviceDailyAttendanceLock,
+  releaseDeviceDailyAttendanceLock,
+  loadDeviceLocksFromDisk,
+  persistDeviceLocks
+};
 
 let sheetDate = serverNow().date;
 setInterval(() => {

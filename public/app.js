@@ -1,9 +1,24 @@
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
 const token = params.get('session');
+const DEVICE_TOKEN_KEY = 'attendance-device-token';
 let config = { subjects: [], batches: [] };
 let records = [];
 let dashboardDate = '';
+
+function generateDeviceToken() {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return `dev-${Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')}`;
+}
+function getDeviceToken() {
+  const existing = localStorage.getItem(DEVICE_TOKEN_KEY);
+  if (existing && /^[A-Za-z0-9._:-]{12,128}$/.test(existing)) return existing;
+  const next = generateDeviceToken();
+  localStorage.setItem(DEVICE_TOKEN_KEY, next);
+  return next;
+}
+const deviceToken = getDeviceToken();
 
 async function api(path, options = {}) {
   const response = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...options });
@@ -24,7 +39,14 @@ async function initStudent() {
 }
 let attendedSubject = '';
 function showAttendanceChecker(name, batch) { $('student-attendance').classList.remove('hidden'); $('attendance-check-name').value = name; $('attendance-check-batch').value = batch; }
-$('attendance-form').addEventListener('submit', async (event) => { event.preventDefault(); message('student-message', 'Saving...'); const name = $('student-name').value; const batch = $('student-batch').value; try { const result = await api('/api/attendance', { method: 'POST', body: JSON.stringify({ token, name, batch }) }); attendedSubject = result.subject; $('attendance-form').classList.add('hidden'); $('confirmation').classList.remove('hidden'); $('confirmation').innerHTML = `<strong>Attendance marked successfully.</strong><br>${escapeHtml(result.name)} · ${escapeHtml(result.batch)} · ${escapeHtml(result.course)}<br>${escapeHtml(result.subject)} · ${escapeHtml(result.date)} · ${escapeHtml(result.status)}`; showAttendanceChecker(result.name, result.batch); } catch (error) { message('student-message', error.message); if (error.message.includes('already been marked')) showAttendanceChecker(name, batch); } });
+function redirectAfterDeviceBlock() {
+  message('student-message', 'Attendance Already Marked. This device has already been used to mark attendance today. You cannot mark another student’s attendance from this device.');
+  setTimeout(() => {
+    window.location.href = '/';
+  }, 1200);
+}
+
+$('attendance-form').addEventListener('submit', async (event) => { event.preventDefault(); message('student-message', 'Saving...'); const name = $('student-name').value; const batch = $('student-batch').value; try { const result = await api('/api/attendance', { method: 'POST', body: JSON.stringify({ token, name, batch, deviceToken }) }); attendedSubject = result.subject; $('attendance-form').classList.add('hidden'); $('confirmation').classList.remove('hidden'); $('confirmation').innerHTML = `<strong>Attendance marked successfully.</strong><br>${escapeHtml(result.name)} · ${escapeHtml(result.batch)} · ${escapeHtml(result.course)}<br>${escapeHtml(result.subject)} · ${escapeHtml(result.date)} · ${escapeHtml(result.status)}`; showAttendanceChecker(result.name, result.batch); } catch (error) { message('student-message', error.message); if (error.message.includes('Attendance Already Marked')) return redirectAfterDeviceBlock(); if (error.message.includes('already been marked')) showAttendanceChecker(name, batch); } });
 $('student-attendance-form').addEventListener('submit', async (event) => { event.preventDefault(); const button = $('attendance-check-button'); button.disabled = true; button.textContent = 'Checking attendance...'; message('attendance-check-message'); $('student-attendance-result').classList.add('hidden'); try { const query = new URLSearchParams({ name: $('attendance-check-name').value, batch: $('attendance-check-batch').value, subject: attendedSubject }); const result = await api(`/api/student-attendance?${query}`); const percentage = `${Number(result.attendance.percentage).toFixed(2).replace(/\.00$/, '')}%`; const date = new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric' }).format(new Date(`${result.today.date}T00:00:00`)); const statusClass = result.today.status.toLowerCase().replace(' ', '-'); $('student-attendance-result').innerHTML = `<div class="attendance-result-head"><strong>Your Attendance</strong><span class="status-pill ${statusClass}">${escapeHtml(result.today.status)}</span></div><p><strong>Student:</strong> ${escapeHtml(result.student.name)}<br><strong>Batch:</strong> ${escapeHtml(result.student.batch)}</p><div class="today-status"><span>Today's Attendance</span><strong>${escapeHtml(date)}</strong><b class="${statusClass}">${result.today.status === 'Present' ? '✓ ' : result.today.status === 'Absent' ? '✕ ' : ''}${escapeHtml(result.today.status)}</b></div><div class="attendance-percentage"><span>Overall Attendance</span><strong>${percentage}</strong><small>${result.attendance.presentDays} Present / ${result.attendance.totalDays} Total Days</small></div>${result.lowAttendance ? `<div class="attendance-warning"><strong>⚠ Low Attendance</strong><span>Your attendance is below the required ${result.minimumRequired}%.</span><span>Current Attendance: ${percentage}</span><span>Please improve your attendance to avoid attendance shortage.</span></div>` : `<div class="attendance-good"><strong>✓ Attendance is Good</strong><span>Your current attendance is ${percentage}.</span></div>`}`; $('student-attendance-result').classList.remove('hidden'); } catch (error) { message('attendance-check-message', error.message); } finally { button.disabled = false; button.textContent = 'Check Attendance'; } });
 $('login-form').addEventListener('submit', async (event) => { event.preventDefault(); message('login-message', 'Opening...'); try { await api('/api/login', { method: 'POST', body: JSON.stringify({ password: $('password').value }) }); await initDashboard(); } catch (error) { message('login-message', error.message); } });
 const attendanceResultObserver = new MutationObserver(() => {
