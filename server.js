@@ -18,7 +18,7 @@ const httpsOptions = httpsEnabled
 if (process.env.HTTPS === 'true' && !httpsEnabled) {
   console.warn('HTTPS requested but SSL_CERT_PATH/SSL_KEY_PATH are missing. Falling back to HTTP for local testing.');
 }
-const subjects = (process.env.SUBJECTS || 'AI-Native Full Stack,GenAI & Agentic AI,Python Full Stack,Java Full Stack,Data Science,MERN Stack Development,Frontend Development,Backend Development,DevOps & Cloud,Data Analytics').split(',').map((subject) => subject.trim()).filter(Boolean).slice(0, 10);
+const subjects = (process.env.SUBJECTS || 'AI-Native Full Stack,GenAI & Agentic AI,Python Full Stack,Java Full Stack,Data Science,MERN Stack Development,Frontend Development,Backend Development,DevOps & Cloud,Data Analytics').split(',').map((subject) => String(subject || '').trim().replace(/\s+/g, ' ')).filter(Boolean).slice(0, 10);
 const batches = [...Array.from({ length: 10 }, (_, i) => `P${i + 1}`), ...Array.from({ length: 10 }, (_, i) => `J${i + 1}`), ...Array.from({ length: 10 }, (_, i) => `D${i + 1}`)];
 const courseFor = (batch) => batch.startsWith('P') ? 'Python Full Stack' : batch.startsWith('J') ? 'Java Full Stack' : 'Data Science';
 const sheetHeaders = ['Date', 'Time', 'Student Name', 'Batch', 'Course', 'Subject', 'Status', 'Attendance Source', 'Session ID'];
@@ -148,6 +148,19 @@ function requireInstructor(req, res, next) {
 function normalizeName(name) {
   return String(name || '').trim().replace(/\s+/g, ' ');
 }
+function normalizeSubjectName(subject) {
+  return String(subject || '').trim().replace(/\s+/g, ' ');
+}
+function resolveSubjectSheetTitle(subject) {
+  const requested = normalizeSubjectName(subject);
+  if (!requested) return requested;
+  const exactMatches = subjects.filter((entry) => normalizeSubjectName(entry) === requested);
+  if (exactMatches.length) return exactMatches[0];
+  const normalizedRequested = requested.toLowerCase();
+  const partialMatches = subjects.filter((entry) => normalizeSubjectName(entry).toLowerCase() === normalizedRequested || normalizeSubjectName(entry).toLowerCase().includes(normalizedRequested) || normalizedRequested.includes(normalizeSubjectName(entry).toLowerCase()));
+  if (partialMatches.length) return partialMatches[0];
+  return requested;
+}
 function serverDateParts(date = new Date()) {
   const parts = new Intl.DateTimeFormat('en-CA', { timeZone: process.env.TIMEZONE || 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).formatToParts(date);
   return Object.fromEntries(parts.filter((p) => p.type !== 'literal').map((p) => [p.type, p.value]));
@@ -225,9 +238,10 @@ async function ensureSheetLayout() {
   return layoutPromise;
 }
 async function syncSubjectMatrix(subject) {
-  const result = await getSheets().spreadsheets.values.get({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, range: `'${subject}'!A1:ZZ10000` });
+  const targetSheet = resolveSubjectSheetTitle(subject);
+  const result = await getSheets().spreadsheets.values.get({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, range: `'${targetSheet}'!A1:ZZ10000` });
   if (!(result.data.values || []).length) {
-    await getSheets().spreadsheets.values.update({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, range: `'${subject}'!A1`, valueInputOption: 'USER_ENTERED', requestBody: { values: [['Student ID', 'Student Name', 'Batch']] } });
+    await getSheets().spreadsheets.values.update({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, range: `'${targetSheet}'!A1`, valueInputOption: 'USER_ENTERED', requestBody: { values: [['Student ID', 'Student Name', 'Batch']] } });
   }
 }
 async function syncAllSubjectMatrices() {
@@ -275,23 +289,52 @@ async function styleAttendanceSheets() {
   });
 }
 async function ensureCurrentDateColumn(subject, date = serverNow().date) {
+  const targetSheet = resolveSubjectSheetTitle(subject);
   await ensureSheetLayout();
-  const result = await getSheets().spreadsheets.values.get({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, range: `'${subject}'!A1:ZZ10000` });
+  const result = await getSheets().spreadsheets.values.get({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, range: `'${targetSheet}'!A1:ZZ10000` });
   const matrix = result.data.values || [['Student ID', 'Student Name', 'Batch']];
   const header = matrix[0] || [];
   if (header.slice(3).some((value) => String(value || '').trim() === date)) return;
 
   const dateColumnIndex = 3;
-  await copyDateColumnFormatting(subject, Math.min(4, Math.max(3, header.length - 1)), dateColumnIndex, true, Math.max(matrix.length, 1000));
+  await copyDateColumnFormatting(targetSheet, Math.min(4, Math.max(3, header.length - 1)), dateColumnIndex, true, Math.max(matrix.length, 1000));
   await getSheets().spreadsheets.values.update({
     spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
-    range: `'${subject}'!${columnName(dateColumnIndex)}1`,
+    range: `'${targetSheet}'!${columnName(dateColumnIndex)}1`,
     valueInputOption: 'USER_ENTERED',
     requestBody: { values: [[date]] }
   });
 }
 async function ensureCurrentDateColumns(date = serverNow().date) {
   await Promise.all(subjects.map((subject) => ensureCurrentDateColumn(subject, date)));
+}
+async function fillMissingDateAbsences(subject, date = serverNow().date) {
+  const targetSheet = resolveSubjectSheetTitle(subject);
+  const result = await getSheets().spreadsheets.values.get({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, range: `'${targetSheet}'!A1:ZZ10000` });
+  const matrix = result.data.values || [];
+  if (!matrix.length) return;
+  const header = matrix[0] || [];
+  const dateIndex = header.findIndex((value) => String(value || '').trim() === date);
+  if (dateIndex < 3) return;
+
+  const updates = [];
+  for (let rowIndex = 1; rowIndex < matrix.length; rowIndex += 1) {
+    const row = matrix[rowIndex] || [];
+    const name = normalizeName(row[1]);
+    const batch = String(row[2] || '').trim();
+    if (!name || !batch) continue;
+    if (String(row[dateIndex] || '').trim()) continue;
+    updates.push({
+      range: `'${targetSheet}'!${columnName(dateIndex)}${rowIndex + 1}`,
+      values: [[holidays.has(date) ? 'Holiday' : 'Absent']]
+    });
+  }
+
+  if (!updates.length) return;
+  await getSheets().spreadsheets.values.batchUpdate({
+    spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
+    requestBody: { valueInputOption: 'USER_ENTERED', data: updates }
+  });
 }
 async function syncAttendanceValidation() {
   const metadata = await getSheets().spreadsheets.get({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, fields: 'sheets.properties.title,sheets.properties.sheetId' });
@@ -324,12 +367,13 @@ function columnName(index) {
   return value;
 }
 async function copyDateColumnFormatting(subject, sourceIndex, destinationIndex, insertColumn = false, validationEndRow = 1000) {
+  const targetSheet = resolveSubjectSheetTitle(subject);
   const metadata = await getSheets().spreadsheets.get({
     spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
     fields: 'sheets.properties'
   });
-  const sheet = metadata.data.sheets.find((entry) => entry.properties.title === subject);
-  if (!sheet) throw new Error(`Subject sheet not found: ${subject}`);
+  const sheet = metadata.data.sheets.find((entry) => entry.properties.title === targetSheet);
+  if (!sheet) throw new Error(`Subject sheet not found: ${targetSheet}`);
   const sheetId = sheet.properties.sheetId;
   await getSheets().spreadsheets.batchUpdate({
     spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
@@ -375,8 +419,9 @@ async function copyDateColumnFormatting(subject, sourceIndex, destinationIndex, 
   });
 }
 async function addAttendanceValidationToRow(subject, rowIndex, dateIndexes) {
+  const targetSheet = resolveSubjectSheetTitle(subject);
   const metadata = await getSheets().spreadsheets.get({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, fields: 'sheets.properties.title,sheets.properties.sheetId' });
-  const sheet = metadata.data.sheets.find((entry) => entry.properties.title === subject);
+  const sheet = metadata.data.sheets.find((entry) => entry.properties.title === targetSheet);
   if (!sheet) return;
   await getSheets().spreadsheets.batchUpdate({
     spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
@@ -391,8 +436,9 @@ async function addAttendanceValidationToRow(subject, rowIndex, dateIndexes) {
   });
 }
 async function appendRow(subject, values) {
+  const targetSheet = resolveSubjectSheetTitle(subject);
   await ensureSheetLayout();
-  const result = await getSheets().spreadsheets.values.get({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, range: `'${subject}'!A1:ZZ10000` });
+  const result = await getSheets().spreadsheets.values.get({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, range: `'${targetSheet}'!A1:ZZ10000` });
   const matrix = result.data.values || [['Student ID', 'Student Name', 'Batch']];
   const header = matrix[0].length >= 3 ? [...matrix[0]] : ['Student ID', 'Student Name', 'Batch'];
   const date = String(values[0] || '').trim();
@@ -409,28 +455,28 @@ async function appendRow(subject, values) {
     : matrix.findIndex((row, index) => index > 0 && normalizeName(row[1]).toLowerCase() === name.toLowerCase() && String(row[2] || '').trim() === batch);
   const targetRow = rowIndex >= 1 ? rowIndex : matrix.length;
   if (newDateColumn) {
-    await copyDateColumnFormatting(subject, 4, dateIndex, true, Math.max(matrix.length, targetRow + 1));
-    await getSheets().spreadsheets.values.update({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, range: `'${subject}'!${columnName(dateIndex)}1`, valueInputOption: 'USER_ENTERED', requestBody: { values: [[date]] } });
+    await copyDateColumnFormatting(targetSheet, 4, dateIndex, true, Math.max(matrix.length, targetRow + 1));
+    await getSheets().spreadsheets.values.update({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, range: `'${targetSheet}'!${columnName(dateIndex)}1`, valueInputOption: 'USER_ENTERED', requestBody: { values: [[date]] } });
   }
   await getSheets().spreadsheets.values.update({
     spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
-    range: `'${subject}'!A${targetRow + 1}:C${targetRow + 1}`,
+    range: `'${targetSheet}'!A${targetRow + 1}:C${targetRow + 1}`,
     valueInputOption: 'USER_ENTERED',
     requestBody: { values: [[registeredStudent?.id || matrix[targetRow]?.[0] || '', name, batch]] }
   });
   const attendanceUpdates = [{
-    range: `'${subject}'!${columnName(dateIndex)}${targetRow + 1}`,
+    range: `'${targetSheet}'!${columnName(dateIndex)}${targetRow + 1}`,
     values: [[values[6] || 'Absent']]
   }];
   if (rowIndex < 1) {
     const existingDateIndexes = header.map((value, index) => index >= 3 && /^\d{4}-\d{2}-\d{2}$/.test(String(value || '').trim()) ? index : -1).filter((index) => index >= 0);
     const validationDateIndexes = [...existingDateIndexes.map((index) => newDateColumn ? index + 1 : index), dateIndex];
-    await addAttendanceValidationToRow(subject, targetRow, [...new Set(validationDateIndexes)]);
+    await addAttendanceValidationToRow(targetSheet, targetRow, [...new Set(validationDateIndexes)]);
     for (const existingDateIndex of existingDateIndexes) {
       const existingDate = String(header[existingDateIndex] || '').trim();
       if (existingDate >= date || existingDate > serverNow().date) continue;
       attendanceUpdates.push({
-        range: `'${subject}'!${columnName(newDateColumn ? existingDateIndex + 1 : existingDateIndex)}${targetRow + 1}`,
+        range: `'${targetSheet}'!${columnName(newDateColumn ? existingDateIndex + 1 : existingDateIndex)}${targetRow + 1}`,
         values: [[holidays.has(existingDate) ? 'Holiday' : 'Absent']]
       });
     }
@@ -442,16 +488,17 @@ async function readRows(tab) {
   const normalized = String(tab || '').trim();
   if (!normalized) return [];
 
-  if (normalized === 'Students' || normalized === 'Percentage') return (await getSheets().spreadsheets.values.get({
+  const resolvedTab = normalized === 'Students' || normalized === 'Percentage' ? normalized : resolveSubjectSheetTitle(normalized);
+  if (resolvedTab === 'Students' || resolvedTab === 'Percentage') return (await getSheets().spreadsheets.values.get({
     spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
-    range: `'${normalized}'!A1:K10000`
+    range: `'${resolvedTab}'!A1:K10000`
   })).data.values || [];
 
   const result = await getSheets().spreadsheets.values.get({
     spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
-    range: `'${normalized}'!A1:ZZ10000`
+    range: `'${resolvedTab}'!A1:ZZ10000`
   });
-  if (!subjects.includes(normalized)) return result.data.values || [];
+  if (!subjects.includes(resolvedTab)) return result.data.values || [];
   const matrix = result.data.values || [];
   const rows = [sheetHeaders];
   for (const row of matrix.slice(1)) {
@@ -691,9 +738,10 @@ app.get('/api/student-attendance', async (req, res) => {
     const attendance = [];
     let student = null;
     for (const currentSubject of targetSubjects) {
+      const targetSheet = resolveSubjectSheetTitle(currentSubject);
       const result = await getSheets().spreadsheets.values.get({
         spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
-        range: `'${currentSubject}'!A1:ZZ10000`
+        range: `'${targetSheet}'!A1:ZZ10000`
       });
       const matrix = result.data.values || [];
       const header = matrix[0] || [];
@@ -816,7 +864,9 @@ setInterval(() => {
   const currentDate = serverNow().date;
   if (currentDate === sheetDate) return;
   sheetDate = currentDate;
-  ensureCurrentDateColumns(currentDate).catch((error) => console.error('Unable to add new date columns:', error.message));
+  ensureCurrentDateColumns(currentDate)
+    .then(() => Promise.all(subjects.map((subject) => fillMissingDateAbsences(subject, currentDate))))
+    .catch((error) => console.error('Unable to add new date columns:', error.message));
 }, 60000);
 
 
