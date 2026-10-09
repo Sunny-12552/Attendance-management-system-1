@@ -1,3 +1,8 @@
 node_modules/
 .env
 *.log
+.admin-account.json
+.admin-account.json.tmp
+data/*.sqlite
+data/*.sqlite-shm
+data/*.sqlite-wal

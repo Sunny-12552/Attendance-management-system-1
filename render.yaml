@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: rollcall-attendance
+    runtime: node
+    plan: starter
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /
+    disk:
+      name: attendance-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: JWT_SECRET
+        generateValue: true
+      - key: DATABASE_URL
+        value: /var/data/attendance.sqlite
+      - key: DEVICE_LOCKS_PATH
+        value: /var/data/.device-locks.json
+      - key: QR_MINUTES
+        value: "30"
+      - key: TIMEZONE
+        value: Asia/Kolkata
+      - key: GOOGLE_SPREADSHEET_ID
+        sync: false
+      - key: GOOGLE_SERVICE_ACCOUNT_JSON
+        sync: false

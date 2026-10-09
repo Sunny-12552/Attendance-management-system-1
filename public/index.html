@@ -9,7 +9,6 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/styles.css">
-  <link rel="stylesheet" href="/branded.css">
   <link rel="stylesheet" href="/attendance.css">
 </head>
 <body>
@@ -23,6 +22,7 @@
       <form id="attendance-form" class="panel form-grid">
         <label>Student name<input id="student-name" name="name" autocomplete="name" placeholder="e.g. Rahul Kumar" minlength="3" pattern="[A-Za-z]+( [A-Za-z]+)*" title="Use at least 3 alphabetic characters and spaces only." required></label>
         <label>Batch<select id="student-batch" name="batch" required></select></label>
+        <label>Email for attendance updates <span class="muted">optional</span><input id="student-email" name="email" type="email" autocomplete="email" placeholder="you@example.com"></label>
         <button class="primary" type="submit">Mark attendance <span>→</span></button>
         <p id="student-message" class="message" role="alert"></p>
       </form>
@@ -41,8 +41,45 @@
     </section>
     <section id="login-view" class="view narrow hidden">
       <div class="eyebrow">INSTRUCTOR ACCESS</div><h1>Attendance,<br><em>in control.</em></h1>
-      <p class="lead">One password opens your attendance desk.</p>
-      <form id="login-form" class="panel form-grid"><label>Instructor password<input id="password" type="password" autocomplete="current-password" required></label><button class="primary" type="submit">Open dashboard <span>→</span></button><p id="login-message" class="message" role="alert"></p></form>
+      <p class="lead">Sign in securely with your admin email.</p>
+      <form id="login-form" class="panel form-grid">
+        <label>Admin email<input id="login-email" type="email" autocomplete="username" required></label>
+        <label>Password<input id="password" type="password" autocomplete="current-password" required></label>
+        <button class="primary" type="submit">Open dashboard <span>→</span></button>
+        <button id="forgot-password-link" class="link-button" type="button">Forgot password?</button>
+        <button id="show-registration-link" class="link-button hidden" type="button">Create admin account</button>
+        <p id="login-message" class="message" role="alert"></p>
+      </form>
+      <form id="registration-form" class="panel form-grid hidden">
+        <h2>Create admin account</h2>
+        <div id="registration-details" class="form-grid">
+          <label>Full name<input id="registration-name" type="text" autocomplete="name" minlength="2" maxlength="100" required></label>
+          <label>Email<input id="registration-email" type="email" autocomplete="email" required></label>
+          <label>Password<input id="registration-password" type="password" autocomplete="new-password" minlength="8" required></label>
+          <label>Confirm password<input id="registration-confirm-password" type="password" autocomplete="new-password" minlength="8" required></label>
+        </div>
+        <div id="registration-credentials" class="form-grid hidden">
+          <label>Verification code<input id="registration-otp" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required></label>
+        </div>
+        <button class="primary" type="submit">Create account <span>→</span></button>
+        <button id="registration-resend" class="link-button hidden" type="button">Resend verification code</button>
+        <button id="resume-signup-link" class="link-button" type="button">Already signed up? Resend verification code</button>
+        <button class="link-button auth-back-link" type="button">Back to login</button>
+        <p id="registration-message" class="message" role="alert"></p>
+      </form>
+      <form id="recovery-form" class="panel form-grid hidden">
+        <h2>Reset your password</h2>
+        <label>Admin email<input id="recovery-email" type="email" autocomplete="email" required></label>
+        <div id="recovery-credentials" class="form-grid hidden">
+          <label>Verification code<input id="recovery-otp" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required></label>
+          <label>New password<input id="recovery-password" type="password" autocomplete="new-password" minlength="8" required></label>
+          <label>Re-enter new password<input id="recovery-confirm-password" type="password" autocomplete="new-password" minlength="8" required></label>
+        </div>
+        <button class="primary" type="submit">Send verification code <span>→</span></button>
+        <button id="recovery-resend" class="link-button hidden" type="button">Resend verification code</button>
+        <button class="link-button auth-back-link" type="button">Back to login</button>
+        <p id="recovery-message" class="message" role="alert"></p>
+      </form>
     </section>
     <section id="dashboard-view" class="view hidden">
       <div class="dashboard-head"><div><div class="eyebrow">INSTRUCTOR DESK</div><h1>Today’s attendance</h1><p class="lead">Create a room, share its QR, and let the sheet do the bookkeeping.</p><p id="dashboard-date" class="dashboard-date" aria-live="polite"></p></div><a class="sheet-link" href="https://sheets.google.com" target="_blank" rel="noreferrer">Open Sheets ↗</a></div>
@@ -51,6 +88,34 @@
         <section class="panel stats"><div class="section-label">LIVE TOTALS</div><div class="stat-number" id="total-count">0</div><p>records loaded today</p><div class="stat-rule"></div><div class="mini-stats"><div><strong id="present-count">0</strong><span>present</span></div><div><strong id="absent-count">0</strong><span>absent</span></div></div></section>
       </div>
       <div class="report-links"><button id="open-records" class="panel report-link" type="button"><span class="section-label">ATTENDANCE LOG</span><strong>Recent records</strong><span>Open detailed attendance →</span></button><button id="open-percentages" class="panel report-link" type="button"><span class="section-label">PERCENTAGE REPORT</span><strong>Subject-wise attendance</strong><span>Open detailed report →</span></button></div>
+      <section class="panel admin-management">
+        <div class="section-label">ADMIN ACCOUNTS</div>
+        <h2>Manage admins</h2>
+        <p class="lead">Invite additional admins by name and email. They must verify their email and create their own password.</p>
+        <form id="admin-invite-form" class="form-grid">
+          <label>Admin name<input id="admin-invite-name" type="text" autocomplete="name" minlength="2" maxlength="100" required></label>
+          <label>Invite email<input id="admin-invite-email" type="email" autocomplete="email" required></label>
+          <button class="secondary" type="submit">Send admin invitation</button>
+          <p id="admin-invite-message" class="message" role="alert"></p>
+        </form>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Name</th><th>Email</th><th>Status</th><th>Last login</th><th>Action</th></tr></thead>
+            <tbody id="admin-accounts"></tbody>
+          </table>
+        </div>
+      </section>
+      <section class="panel">
+        <div class="section-label">EMAIL SUMMARY</div>
+        <h2>Send a student attendance summary</h2>
+        <p class="lead">Uses the saved student email and attendance records from Google Sheets.</p>
+        <form id="summary-email-form" class="form-grid">
+          <label>Student name<input id="summary-email-name" type="text" autocomplete="name" required></label>
+          <label>Batch<select id="summary-email-batch" required></select></label>
+          <button class="secondary" type="submit">Send attendance summary</button>
+          <p id="summary-email-message" class="message" role="alert"></p>
+        </form>
+      </section>
         <section class="panel correction-panel"><div class="section-label">OPTIONAL DATE</div><h2>Instructor correction</h2><p class="lead">Use this for a student who was physically present but could not scan. Leave the date blank to update today.</p><form id="correction-form" class="correction-grid"><input id="correction-name" placeholder="Student name" required><select id="correction-batch" required></select><select id="correction-subject" required></select><input id="correction-date" type="date" aria-label="Correction date"><select id="correction-status" required><option>Present</option><option>Absent</option></select><button class="secondary" type="submit">Save correction</button></form><p id="correction-message" class="message" role="alert"></p></section>
     </section>
     <section id="records-view" class="view hidden">

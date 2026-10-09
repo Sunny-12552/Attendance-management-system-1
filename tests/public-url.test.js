@@ -1,0 +1,61 @@
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+import { resolvePublicUrl } from '../public-url.js';
+
+const networkInterfaces = {
+  Ethernet: [
+    { address: '192.168.1.42', family: 'IPv4', internal: false },
+    { address: '127.0.0.1', family: 'IPv4', internal: true }
+  ]
+};
+
+test('uses the machine LAN address when APP_URL is set to localhost', () => {
+  assert.equal(
+    resolvePublicUrl(undefined, { configuredUrl: 'http://localhost:3000', networkInterfaces }),
+    'http://192.168.1.42:3000'
+  );
+});
+
+test('preserves an explicitly configured public URL', () => {
+  assert.equal(
+    resolvePublicUrl(undefined, { configuredUrl: 'https://attendance.example.com/', networkInterfaces }),
+    'https://attendance.example.com'
+  );
+});
+
+test('replaces a loopback request host with the machine LAN address', () => {
+  assert.equal(
+    resolvePublicUrl({ headers: { host: '127.0.0.1:3000' } }, { networkInterfaces }),
+    'http://192.168.1.42:3000'
+  );
+});
+
+test('uses the public HTTPS host from a reverse proxy for QR URLs', () => {
+  assert.equal(
+    resolvePublicUrl({
+      headers: {
+        'x-forwarded-host': 'rollcall.example.com',
+        'x-forwarded-proto': 'https',
+        host: 'internal-service:3000'
+      }
+    }, { networkInterfaces }),
+    'https://rollcall.example.com'
+  );
+});
+
+test('rejects a local URL when no phone-accessible LAN address exists', () => {
+  assert.throws(
+    () => resolvePublicUrl(undefined, {
+      configuredUrl: 'http://localhost:3000',
+      networkInterfaces: { Loopback: [{ address: '127.0.0.1', family: 'IPv4', internal: true }] }
+    }),
+    /No LAN IPv4 address is available/
+  );
+});
+
+test('rejects an invalid configured APP_URL instead of generating a broken QR', () => {
+  assert.throws(
+    () => resolvePublicUrl(undefined, { configuredUrl: 'not-a-url' }),
+    /APP_URL must be a valid absolute URL/
+  );
+});
