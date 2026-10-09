@@ -3,6 +3,7 @@ import express from 'express';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import https from 'node:https';
+import { isIP } from 'node:net';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
@@ -12,8 +13,19 @@ import Database from 'better-sqlite3';
 import QRCode from 'qrcode';
 import { google } from 'googleapis';
 import { calendarDatesBetween, isCountedClassStatus, isHolidayDate, newestFirstDates, statusForUnmarkedDate } from './attendance-calendar.js';
-import { bindDeviceToStudent } from './device-binding.js';
+import {
+  bindDevice,
+  checkDeviceOwner,
+  importLegacyStudentLocks,
+  initializeDeviceRegistry,
+  listAdminAuditLog,
+  listDeviceRegistry,
+  recordDeviceAttendance,
+  releaseNewDeviceBinding,
+  unlockDevice
+} from './device-registry.js';
 import { resolvePublicUrl as buildPublicUrl } from './public-url.js';
+import { loadGoogleServiceAccountCredentials } from './google-service-account.js';
 import {
   emailDeliveryErrorMessage,
   emailConfigurationMessage,
@@ -45,22 +57,28 @@ const sheetHeaders = ['Date', 'Time', 'Student Name', 'Batch', 'Course', 'Subjec
 const sessions = new Map();
 const studentRegistrationLocks = new Map();
 const deviceAttendanceLocks = new Map();
-const studentDeviceLocks = new Map();
 const activeDeviceLockClaims = new Map();
-const activeStudentDeviceLockClaims = new Map();
 const DEVICE_LOCKS_PATH = process.env.DEVICE_LOCKS_PATH
   ? path.resolve(__dirname, process.env.DEVICE_LOCKS_PATH)
   : path.join(__dirname, '.device-locks.json');
 const LEGACY_ADMIN_ACCOUNT_PATH = path.join(__dirname, '.admin-account.json');
 const configuredSessionSecret = process.env.JWT_SECRET || process.env.SESSION_SECRET || '';
 const sessionSecret = configuredSessionSecret || crypto.randomBytes(32).toString('hex');
+const mainAdminBootstrapSecret = String(process.env.MAIN_ADMIN_BOOTSTRAP_SECRET || '');
+if (mainAdminBootstrapSecret && mainAdminBootstrapSecret.length < 32) {
+  throw new Error('MAIN_ADMIN_BOOTSTRAP_SECRET must contain at least 32 characters.');
+}
 const scrypt = promisify(crypto.scrypt);
-const qrMinutes = Number(process.env.QR_MINUTES || Number.MAX_SAFE_INTEGER);
+const qrMinutes = Number(process.env.QR_MINUTES || 30);
+if (!Number.isSafeInteger(qrMinutes) || qrMinutes < 1) {
+  throw new Error('QR_MINUTES must be a positive whole number of minutes.');
+}
 const minAttendancePercentage = Number(process.env.MIN_ATTENDANCE_PERCENTAGE || 75);
 const databaseUrl = String(process.env.DATABASE_URL || './data/attendance.sqlite').trim();
 const databasePath = path.resolve(__dirname, databaseUrl.replace(/^sqlite:/, ''));
 let authDb = null;
 const authRateLimits = new Map();
+const deviceRegistrySheetSyncs = new Map();
 const dummyPasswordHash = bcrypt.hashSync(`invalid-password-${crypto.randomBytes(32).toString('hex')}`, 12);
 const attendanceValidationRule = { condition: { type: 'ONE_OF_LIST', values: [{ userEnteredValue: 'Present' }, { userEnteredValue: 'Absent' }, { userEnteredValue: 'Holiday' }] }, showCustomUi: true, strict: false };
 const holidays = new Set((process.env.HOLIDAYS || '').split(',').map((date) => date.trim()).filter((date) => /^\d{4}-\d{2}-\d{2}$/.test(date)));
@@ -80,7 +98,11 @@ function resolvePublicUrl(req) {
 app.use(express.json({ limit: '20kb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-app.enable('trust proxy');
+const trustProxyHops = Number(process.env.TRUST_PROXY_HOPS || (process.env.NODE_ENV === 'production' ? 1 : 0));
+if (!Number.isSafeInteger(trustProxyHops) || trustProxyHops < 0) {
+  throw new Error('TRUST_PROXY_HOPS must be a non-negative whole number.');
+}
+app.set('trust proxy', trustProxyHops);
 
 function sign(value) {
   return crypto.createHmac('sha256', sessionSecret).update(value).digest('hex');
@@ -91,13 +113,13 @@ function hashDeviceToken(deviceToken) {
 function isValidDeviceToken(deviceToken) {
   return typeof deviceToken === 'string' && deviceTokenPattern.test(deviceToken.trim());
 }
+function clientIpAddress(req) {
+  const forwarded = String(req.ip || '').split('%')[0].toLowerCase();
+  if (forwarded.startsWith('::ffff:') && isIP(forwarded.slice(7)) === 4) return forwarded.slice(7);
+  return isIP(forwarded) ? forwarded : '';
+}
 function getDeviceLockKey(date, deviceToken, qrSessionId) {
   return `${String(date || '').trim()}|${String(qrSessionId || '').trim()}|${hashDeviceToken(deviceToken)}`;
-}
-function getStudentDeviceLockKey(name, batch) {
-  return crypto.createHash('sha256')
-    .update(`${normalizeName(name).toLowerCase()}|${String(batch || '').trim()}`)
-    .digest('hex');
 }
 async function loadDeviceLocksFromDisk() {
   try {
@@ -112,17 +134,14 @@ async function loadDeviceLocksFromDisk() {
       if (!qrSessionId || !deviceTokenHash) continue;
       deviceAttendanceLocks.set(key, { ...value, qrSessionId, deviceTokenHash });
     }
-    for (const [key, value] of Object.entries(parsed.studentDeviceLocks || {})) {
-      if (value && typeof value.deviceTokenHash === 'string') studentDeviceLocks.set(key, value);
-    }
+    importLegacyStudentLocks(authDb, parsed.studentDeviceLocks);
   } catch (error) {
-    if (error.code !== 'ENOENT') console.warn('Unable to read device-lock store:', error.message);
+    if (error.code !== 'ENOENT') throw new Error(`Unable to read the existing device-lock store: ${error.message}`, { cause: error });
   }
 }
 async function persistDeviceLocks() {
   await fs.promises.writeFile(DEVICE_LOCKS_PATH, JSON.stringify({
-    deviceAttendanceLocks: Object.fromEntries(deviceAttendanceLocks),
-    studentDeviceLocks: Object.fromEntries(studentDeviceLocks)
+    deviceAttendanceLocks: Object.fromEntries(deviceAttendanceLocks)
   }, null, 2), 'utf8');
 }
 async function isDeviceSessionAttendanceLocked(date, deviceToken, qrSessionId) {
@@ -166,54 +185,6 @@ async function releaseDeviceSessionAttendanceLock(date, deviceToken, qrSessionId
   await persistDeviceLocks();
   return true;
 }
-async function claimStudentDeviceLock(name, batch, deviceToken) {
-  if (!isValidDeviceToken(deviceToken)) {
-    return { allowed: false, reason: 'Unable to identify this device. Please refresh the page and try again.' };
-  }
-  const key = getStudentDeviceLockKey(name, batch);
-  const deviceTokenHash = hashDeviceToken(deviceToken);
-  const pending = activeStudentDeviceLockClaims.get(key);
-  if (pending) await pending;
-
-  const existing = studentDeviceLocks.get(key);
-  if (existing) {
-    return existing.deviceTokenHash === deviceTokenHash
-      ? { allowed: true, newlyBound: false }
-      : { allowed: false, reason: 'This student account is already linked to a different device. Use the device first used to mark attendance.' };
-  }
-
-  const attempt = (async () => {
-    const binding = bindDeviceToStudent(studentDeviceLocks, key, deviceTokenHash);
-    if (!binding.allowed) {
-      return {
-        ...binding,
-        reason: 'This student account is already linked to a different device. Use the device first used to mark attendance.'
-      };
-    }
-    if (!binding.newlyBound) return binding;
-    try {
-      await persistDeviceLocks();
-    } catch (error) {
-      studentDeviceLocks.delete(key);
-      throw error;
-    }
-    return binding;
-  })();
-  activeStudentDeviceLockClaims.set(key, attempt);
-  try {
-    return await attempt;
-  } finally {
-    if (activeStudentDeviceLockClaims.get(key) === attempt) activeStudentDeviceLockClaims.delete(key);
-  }
-}
-async function releaseStudentDeviceLock(name, batch, deviceToken) {
-  if (!isValidDeviceToken(deviceToken)) return false;
-  const key = getStudentDeviceLockKey(name, batch);
-  if (studentDeviceLocks.get(key)?.deviceTokenHash !== hashDeviceToken(deviceToken)) return false;
-  studentDeviceLocks.delete(key);
-  await persistDeviceLocks();
-  return true;
-}
 function instructorCookie(adminId) {
   const sessionId = crypto.randomBytes(32).toString('base64url');
   const expiresAt = Date.now() + 8 * 60 * 60 * 1000;
@@ -231,14 +202,22 @@ function normalizeEmail(email) {
 function isValidEmail(email) {
   return typeof email === 'string' && email.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
+function backupBeforeAdminApprovalMigration(schemaVersion) {
+  if (schemaVersion < 1 || schemaVersion >= 7 || !fs.existsSync(databasePath)) return;
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const backupPath = `${databasePath}.pre-v7-${stamp}-${crypto.randomUUID().slice(0, 8)}.bak`;
+  const escapedPath = backupPath.replace(/'/g, "''");
+  authDb.exec(`VACUUM INTO '${escapedPath}'`);
+}
 function initializeAuthDatabase() {
   fs.mkdirSync(path.dirname(databasePath), { recursive: true });
   authDb = new Database(databasePath);
   authDb.pragma('journal_mode = WAL');
   authDb.pragma('foreign_keys = ON');
   authDb.pragma('busy_timeout = 5000');
-  const schemaVersion = authDb.pragma('user_version', { simple: true });
-  if (schemaVersion > 2) throw new Error(`Unsupported attendance auth database version ${schemaVersion}.`);
+  let schemaVersion = authDb.pragma('user_version', { simple: true });
+  if (schemaVersion > 7) throw new Error(`Unsupported attendance auth database version ${schemaVersion}.`);
+  backupBeforeAdminApprovalMigration(schemaVersion);
   if (schemaVersion < 1) {
     const migrate = authDb.transaction(() => {
       authDb.exec(`
@@ -287,7 +266,165 @@ function initializeAuthDatabase() {
     });
     migrateOtpVerificationState();
   }
+  schemaVersion = authDb.pragma('user_version', { simple: true });
+  if (schemaVersion < 3) {
+    const migrateDeviceSecurity = authDb.transaction(() => {
+      for (const [column, declaration] of [
+        ['failed_login_attempts', 'INTEGER NOT NULL DEFAULT 0'],
+        ['last_successful_login', 'TEXT'],
+        ['last_password_change_at', 'TEXT'],
+        ['account_lock_until', 'INTEGER']
+      ]) {
+        if (!authDb.pragma('table_info(admins)').some((entry) => entry.name === column)) {
+          authDb.exec(`ALTER TABLE admins ADD COLUMN ${column} ${declaration}`);
+        }
+      }
+      authDb.exec(`
+        UPDATE admins SET last_password_change_at = created_at
+        WHERE last_password_change_at IS NULL AND password_hash IS NOT NULL;
+      `);
+      initializeDeviceRegistry(authDb);
+      authDb.pragma('user_version = 3');
+    });
+    migrateDeviceSecurity();
+  } else {
+    initializeDeviceRegistry(authDb);
+  }
+  schemaVersion = authDb.pragma('user_version', { simple: true });
+  if (schemaVersion < 4) {
+    const migrateMainAdmin = authDb.transaction(() => {
+      authDb.exec(`
+        CREATE TABLE IF NOT EXISTS main_admin_config (
+          singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+          admin_id TEXT UNIQUE REFERENCES admins(id),
+          created_at TEXT
+        );
+        INSERT OR IGNORE INTO main_admin_config (singleton, admin_id, created_at) VALUES (1, NULL, NULL);
+      `);
+      for (const [column, declaration] of [
+        ['acting_admin_role', "TEXT NOT NULL DEFAULT 'ADMIN'"],
+        ['target_admin_id', 'TEXT'],
+        ['result', "TEXT NOT NULL DEFAULT 'success'"],
+        ['last_status_change_at', 'TEXT'],
+        ['removed_at', 'TEXT']
+      ]) {
+        const table = ['last_status_change_at', 'removed_at'].includes(column) ? 'admins' : 'admin_audit_log';
+        if (!authDb.pragma(`table_info(${table})`).some((entry) => entry.name === column)) {
+          authDb.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${declaration}`);
+        }
+      }
+      authDb.pragma('user_version = 4');
+    });
+    migrateMainAdmin();
+  }
+  schemaVersion = authDb.pragma('user_version', { simple: true });
+  if (schemaVersion < 5) {
+    const migrateAdminAccessRequests = authDb.transaction(() => {
+      authDb.exec(`
+        CREATE TABLE IF NOT EXISTS admin_access_requests (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          email TEXT NOT NULL COLLATE NOCASE,
+          status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
+          created_at TEXT NOT NULL,
+          reviewed_at TEXT,
+          reviewed_by TEXT REFERENCES admins(id),
+          rejection_reason TEXT,
+          invite_admin_id TEXT REFERENCES admins(id)
+        );
+        CREATE INDEX IF NOT EXISTS admin_access_requests_status_idx
+          ON admin_access_requests(status, created_at);
+      `);
+      authDb.pragma('user_version = 5');
+    });
+    migrateAdminAccessRequests();
+  }
+  schemaVersion = authDb.pragma('user_version', { simple: true });
+  if (schemaVersion < 6) {
+    const migrateTemporaryAdminPasswords = authDb.transaction(() => {
+      if (!authDb.pragma('table_info(admins)').some((column) => column.name === 'must_change_password')) {
+        authDb.exec('ALTER TABLE admins ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0 CHECK (must_change_password IN (0, 1))');
+      }
+      authDb.pragma('user_version = 6');
+    });
+    migrateTemporaryAdminPasswords();
+  }
+  schemaVersion = authDb.pragma('user_version', { simple: true });
+  if (schemaVersion < 7) {
+    const migrateAdminApprovalAndSubjects = authDb.transaction(() => {
+      for (const [column, declaration] of [
+        ['phone', 'TEXT'],
+        ['approval_status', "TEXT NOT NULL DEFAULT 'approved' CHECK (approval_status IN ('pending', 'approved', 'rejected'))"],
+        ['approval_reviewed_at', 'TEXT'],
+        ['approval_reviewed_by', 'TEXT REFERENCES admins(id)']
+      ]) {
+        if (!authDb.pragma('table_info(admins)').some((entry) => entry.name === column)) {
+          authDb.exec(`ALTER TABLE admins ADD COLUMN ${column} ${declaration}`);
+        }
+      }
+      authDb.exec(`
+        CREATE TABLE IF NOT EXISTS admin_subject_assignments (
+          admin_id TEXT NOT NULL REFERENCES admins(id) ON DELETE CASCADE,
+          subject TEXT NOT NULL,
+          assigned_at TEXT NOT NULL,
+          assigned_by TEXT REFERENCES admins(id),
+          PRIMARY KEY (admin_id, subject)
+        );
+        CREATE INDEX IF NOT EXISTS admin_subject_assignments_subject_idx
+          ON admin_subject_assignments(subject);
+      `);
+      authDb.exec('CREATE UNIQUE INDEX IF NOT EXISTS admins_phone_unique_idx ON admins(phone) WHERE phone IS NOT NULL');
+      const assignLegacySubjects = authDb.prepare(`
+        INSERT OR IGNORE INTO admin_subject_assignments (admin_id, subject, assigned_at)
+        SELECT id, ?, created_at FROM admins
+      `);
+      for (const subject of subjects) assignLegacySubjects.run(subject);
+      authDb.pragma('user_version = 7');
+    });
+    migrateAdminApprovalAndSubjects();
+  }
   migrateLegacyAdminAccount();
+  scrubPreviouslyRemovedAdminAccounts();
+}
+function anonymizeRemovedAdminData(target) {
+  const anonymizedEmail = `removed+${target.id}@removed.invalid`;
+  authDb.prepare(`
+    UPDATE admins SET
+      name = 'Removed admin', email = ?, phone = NULL, password_hash = NULL,
+      is_verified = 0, is_active = 0, approval_status = 'rejected',
+      must_change_password = 0, last_login = NULL, last_successful_login = NULL,
+      last_password_change_at = NULL, failed_login_attempts = 0, account_lock_until = NULL
+    WHERE id = ?
+  `).run(anonymizedEmail, target.id);
+  authDb.prepare('DELETE FROM auth_sessions WHERE admin_id = ?').run(target.id);
+  authDb.prepare('DELETE FROM otp_verifications WHERE admin_id = ?').run(target.id);
+  authDb.prepare('DELETE FROM admin_subject_assignments WHERE admin_id = ?').run(target.id);
+  authDb.prepare(`
+    UPDATE admin_audit_log SET
+      affected_record = 'Removed admin',
+      reason = 'Account details were erased during admin removal.'
+    WHERE admin_id = ? OR target_admin_id = ?
+  `).run(target.id, target.id);
+  authDb.prepare(`
+    UPDATE admin_access_requests SET
+      name = 'Removed admin', email = ?, status = 'rejected',
+      rejection_reason = 'Account details were erased during admin removal.'
+    WHERE invite_admin_id = ? OR email = ? COLLATE NOCASE
+  `).run(anonymizedEmail, target.id, target.email);
+}
+function scrubPreviouslyRemovedAdminAccounts() {
+  const removedAdmins = authDb.prepare(`
+    SELECT id, email FROM admins
+    WHERE removed_at IS NOT NULL
+      AND (name != 'Removed admin' OR email NOT LIKE 'removed+%@removed.invalid'
+        OR phone IS NOT NULL OR password_hash IS NOT NULL OR last_login IS NOT NULL
+        OR last_successful_login IS NOT NULL OR last_password_change_at IS NOT NULL)
+  `).all();
+  if (!removedAdmins.length) return;
+  authDb.transaction(() => {
+    for (const admin of removedAdmins) anonymizeRemovedAdminData(admin);
+  })();
+  console.info(`Erased personal and login details for ${removedAdmins.length} previously removed admin account(s).`);
 }
 function migrateLegacyAdminAccount() {
   let data;
@@ -306,6 +443,12 @@ function migrateLegacyAdminAccount() {
       (id, name, email, password_hash, role, is_verified, is_active, created_at, updated_at)
     VALUES (?, ?, ?, ?, 'ADMIN', 1, 1, ?, ?)
   `).run(crypto.randomUUID(), String(data.name || 'Admin'), normalizeEmail(data.email), `scrypt$${data.salt}$${data.passwordHash}`, now, now);
+  const legacyAdmin = authDb.prepare('SELECT id FROM admins WHERE email = ? COLLATE NOCASE').get(normalizeEmail(data.email));
+  const assignLegacySubject = authDb.prepare(`
+    INSERT OR IGNORE INTO admin_subject_assignments (admin_id, subject, assigned_at)
+    VALUES (?, ?, ?)
+  `);
+  for (const subject of subjects) assignLegacySubject.run(legacyAdmin.id, subject, now);
 }
 function validPassword(password) {
   return typeof password === 'string' && password.length >= 8 && password.length <= 128;
@@ -341,7 +484,18 @@ function rateLimit(key, maximum, windowMs) {
 function rateLimitKey(req, operation, email = '') {
   return `${operation}:${req.ip}:${normalizeEmail(email)}`;
 }
-async function createOtp(adminId, purpose) {
+async function generateTemporaryPassword(name, previousPasswordHash = '') {
+  const namePrefix = String(name || '').trim().split(/\s+/)[0]
+    .normalize('NFKD').replace(/[^A-Za-z0-9]/g, '').slice(0, 8) || 'Admin';
+  const firstSuffix = crypto.randomInt(0, 1000);
+  for (let offset = 0; offset < 1000; offset += 1) {
+    const randomSuffix = ((firstSuffix + offset) % 1000).toString().padStart(3, '0');
+    const candidate = `${namePrefix}${randomSuffix}`;
+    if (!previousPasswordHash || !(await verifyStoredPassword(candidate, previousPasswordHash))) return candidate;
+  }
+  throw new Error('Unable to generate a new temporary administrator password.');
+}
+async function createOtp(adminId, purpose, { temporaryPassword } = {}) {
   const code = crypto.randomInt(0, 1_000_000).toString().padStart(6, '0');
   const otpHash = await bcrypt.hash(code, 10);
   const expiresAt = Date.now() + 10 * 60 * 1000;
@@ -366,7 +520,8 @@ async function createOtp(adminId, purpose) {
       email: admin.email,
       role: admin.role,
       otp: code,
-      expiryMinutes: 10
+      expiryMinutes: 10,
+      temporaryPassword
     };
     if (purpose === 'reset') await sendPasswordResetOtp(emailDetails);
     else if (purpose === 'invite') await sendAdminInvitation(emailDetails);
@@ -386,18 +541,60 @@ function sessionAdmin(req) {
   const expected = Buffer.from(sign(sessionId));
   if (received.length !== expected.length || !crypto.timingSafeEqual(received, expected)) return null;
   return authDb.prepare(`
-    SELECT admins.id, admins.name, admins.email, admins.role
+    SELECT admins.id, admins.name, admins.email, admins.must_change_password AS mustChangePassword,
+      CASE WHEN main_admin_config.admin_id = admins.id THEN 'MAIN_ADMIN' ELSE 'ADMIN' END AS role
     FROM auth_sessions
     JOIN admins ON admins.id = auth_sessions.admin_id
+    LEFT JOIN main_admin_config ON main_admin_config.singleton = 1
     WHERE auth_sessions.token_hash = ? AND auth_sessions.expires_at > ?
-      AND admins.is_verified = 1 AND admins.is_active = 1 AND admins.role = 'ADMIN'
+      AND admins.is_verified = 1 AND admins.is_active = 1
+      AND admins.approval_status = 'approved'
+      AND admins.removed_at IS NULL
   `).get(crypto.createHash('sha256').update(sessionId).digest('hex'), Date.now()) || null;
 }
 function requireInstructor(req, res, next) {
   const admin = sessionAdmin(req);
   if (!admin) return res.status(401).json({ error: 'Admin login required.' });
+  if (admin.mustChangePassword) return res.status(403).json({ error: 'Change your temporary password before using the dashboard.' });
   req.admin = admin;
   next();
+}
+function requireMainAdmin(req, res, next) {
+  if (req.admin.role !== 'MAIN_ADMIN') return res.status(403).json({ error: 'Main Admin access required.' });
+  next();
+}
+function assignedSubjects(admin) {
+  if (admin.role === 'MAIN_ADMIN') return subjects;
+  return authDb.prepare('SELECT subject FROM admin_subject_assignments WHERE admin_id = ? ORDER BY subject').all(admin.id)
+    .map((entry) => entry.subject)
+    .filter((subject) => subjects.includes(subject));
+}
+function canAccessSubject(admin, subject) {
+  return subjects.includes(subject) && assignedSubjects(admin).includes(subject);
+}
+function sessionIssuerCanAccess(session) {
+  if (!session?.createdBy) return false;
+  const issuer = authDb.prepare(`
+    SELECT admins.id,
+      CASE WHEN main_admin_config.admin_id = admins.id THEN 'MAIN_ADMIN' ELSE 'ADMIN' END AS role
+    FROM admins CROSS JOIN main_admin_config
+    WHERE admins.id = ? AND admins.is_verified = 1 AND admins.is_active = 1
+      AND admins.approval_status = 'approved' AND admins.removed_at IS NULL
+  `).get(session.createdBy);
+  return !!issuer && canAccessSubject(issuer, session.subject);
+}
+function requireSubjectAccess(req, res, subject) {
+  if (!canAccessSubject(req.admin, subject)) {
+    bad(res, 403, 'You are not assigned to this subject.');
+    return false;
+  }
+  return true;
+}
+function bootstrapSecretMatches(candidate) {
+  if (mainAdminBootstrapSecret.length < 32 || typeof candidate !== 'string') return false;
+  const expected = Buffer.from(mainAdminBootstrapSecret);
+  const received = Buffer.from(candidate);
+  return expected.length === received.length && crypto.timingSafeEqual(expected, received);
 }
 function normalizeName(name) {
   return String(name || '').trim().replace(/\s+/g, ' ');
@@ -442,11 +639,7 @@ let layoutPromise;
 function getSheets() {
   if (sheets) return sheets;
   if (!process.env.GOOGLE_SPREADSHEET_ID) throw new Error('Google Sheets is not configured.');
-  const credentials = process.env.GOOGLE_SERVICE_ACCOUNT_FILE
-    ? JSON.parse(fs.readFileSync(process.env.GOOGLE_SERVICE_ACCOUNT_FILE, 'utf8'))
-    : process.env.GOOGLE_SERVICE_ACCOUNT_JSON
-      ? JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON)
-      : null;
+  const credentials = loadGoogleServiceAccountCredentials();
   if (!credentials) throw new Error('Google service-account credentials are not configured.');
   const auth = new google.auth.GoogleAuth({ credentials, scopes: ['https://www.googleapis.com/auth/spreadsheets'] });
   sheets = google.sheets({ version: 'v4', auth });
@@ -526,6 +719,224 @@ async function ensureSheetLayout() {
     await service.spreadsheets.values.batchUpdate({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, requestBody: { valueInputOption: 'USER_ENTERED', data: headers.map(([title, values]) => ({ range: `'${title}'!A1`, values: [values] })) } });
   })();
   return layoutPromise;
+}
+const securitySheetHeaders = {
+  'Device Registry': [
+    'Student ID', 'Student Name', 'Batch', 'Course', 'Device ID Hash',
+    'Registered IP Address', 'First Registered At', 'Last Seen At', 'Device Status',
+    'Last Attendance Subject', 'Last Attendance Date', 'Admin Unlock Timestamp', 'Unlock Reason'
+  ],
+  'Admin Accounts': [
+    'Admin ID', 'Admin Email', 'Admin Role', 'Account Status', 'Created At',
+    'Last Login At', 'Last Status Change At', 'Last Password Change At', 'Failed Login Attempts',
+    'Last Successful Login', 'Account Lock Status'
+  ],
+  'Admin Audit Log': [
+    'Audit ID', 'Timestamp', 'Admin ID', 'Admin Email', 'Action', 'Affected Record', 'Reason',
+    'Acting Admin Role', 'Target Admin ID', 'Result'
+  ]
+};
+const legacySecuritySheetHeaders = {
+  'Admin Accounts': [
+    'Admin ID', 'Admin Email', 'Admin Role', 'Account Status', 'Created At',
+    'Last Login At', 'Last Password Change At', 'Failed Login Attempts',
+    'Last Successful Login', 'Account Lock Status'
+  ],
+  'Admin Audit Log': [
+    'Audit ID', 'Timestamp', 'Admin ID', 'Admin Email', 'Action', 'Affected Record', 'Reason'
+  ]
+};
+async function ensureSecuritySheets() {
+  await ensureSheetLayout();
+  const service = getSheets();
+  let metadata = await readSheetsMetadata('sheets.properties.title,sheets.properties.sheetId');
+  let sheetsByTitle = new Map(metadata.data.sheets.map((sheet) => [sheet.properties.title, sheet.properties.sheetId]));
+  const missing = Object.keys(securitySheetHeaders).filter((title) => !sheetsByTitle.has(title));
+  if (missing.length) {
+    await service.spreadsheets.batchUpdate({
+      spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
+      requestBody: { requests: missing.map((title) => ({ addSheet: { properties: { title } } })) }
+    });
+    metadata = await readSheetsMetadata('sheets.properties.title,sheets.properties.sheetId');
+    sheetsByTitle = new Map(metadata.data.sheets.map((sheet) => [sheet.properties.title, sheet.properties.sheetId]));
+  }
+  for (const [title, headers] of Object.entries(securitySheetHeaders)) {
+    const result = await service.spreadsheets.values.get({
+      spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
+      range: `'${title}'!A1:${columnName(headers.length - 1)}1`
+    });
+    const existingHeaders = result.data.values?.[0] || [];
+    if (!existingHeaders.length) {
+      await service.spreadsheets.values.update({
+        spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
+        range: `'${title}'!A1`,
+        valueInputOption: 'RAW',
+        requestBody: { values: [headers] }
+      });
+    } else if (headers.some((header, index) => existingHeaders[index] !== header)) {
+      const legacyHeaders = legacySecuritySheetHeaders[title];
+      const isKnownLegacy = legacyHeaders
+        && legacyHeaders.every((header, index) => existingHeaders[index] === header)
+        && existingHeaders.slice(legacyHeaders.length).every((header) => !header);
+      if (!isKnownLegacy) throw new Error(`The existing "${title}" sheet has unexpected headers; it was not modified.`);
+      await service.spreadsheets.values.update({
+        spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
+        range: `'${title}'!A1`,
+        valueInputOption: 'RAW',
+        requestBody: { values: [headers] }
+      });
+    }
+  }
+  return sheetsByTitle;
+}
+async function writeDeviceRegistrySheetRow(record) {
+  await ensureSecuritySheets();
+  const range = "'Device Registry'!A2:M10000";
+  const response = await getSheets().spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
+    range
+  });
+  const values = response.data.values || [];
+  const index = values.findIndex((row) => row[4] === record.deviceHash);
+  const row = [
+    record.studentId || '', record.studentName, record.batch, record.course, record.deviceHash,
+    record.registeredIp, record.firstRegisteredAt, record.lastSeenAt, record.status,
+    record.lastAttendanceSubject, record.lastAttendanceDate,
+    record.adminUnlockTimestamp || '', record.unlockReason || ''
+  ];
+  if (index >= 0) {
+    await getSheets().spreadsheets.values.update({
+      spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
+      range: `'Device Registry'!A${index + 2}:M${index + 2}`,
+      valueInputOption: 'RAW',
+      requestBody: { values: [row] }
+    });
+  } else {
+    await getSheets().spreadsheets.values.append({
+      spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
+      range: "'Device Registry'!A:M",
+      valueInputOption: 'RAW',
+      insertDataOption: 'INSERT_ROWS',
+      requestBody: { values: [row] }
+    });
+  }
+}
+async function upsertDeviceRegistrySheetRow(record) {
+  const pending = deviceRegistrySheetSyncs.get(record.deviceHash);
+  if (pending) {
+    await pending;
+    return upsertDeviceRegistrySheetRow(record);
+  }
+  const sync = writeDeviceRegistrySheetRow(record);
+  deviceRegistrySheetSyncs.set(record.deviceHash, sync);
+  try {
+    return await sync;
+  } finally {
+    if (deviceRegistrySheetSyncs.get(record.deviceHash) === sync) {
+      deviceRegistrySheetSyncs.delete(record.deviceHash);
+    }
+  }
+}
+async function syncDeviceRegistrySheet() {
+  await ensureSecuritySheets();
+  const latestRecords = new Map();
+  for (const record of listDeviceRegistry(authDb)) {
+    const existing = latestRecords.get(record.deviceHash);
+    if (!existing || record.status === 'active' || (
+      existing.status !== 'active'
+      && record.lastSeenAt > existing.lastSeenAt
+    )) {
+      latestRecords.set(record.deviceHash, record);
+    }
+  }
+  for (const record of latestRecords.values()) {
+    await upsertDeviceRegistrySheetRow(record);
+  }
+}
+async function syncAdminAccountsSheet() {
+  await ensureSecuritySheets();
+  const rows = authDb.prepare(`
+    SELECT admins.id, admins.email, admins.role, admins.is_verified, admins.is_active, admins.approval_status,
+      admins.removed_at,
+      admins.created_at, admins.last_login, admins.last_status_change_at,
+      admins.last_password_change_at, admins.failed_login_attempts,
+      admins.last_successful_login, admins.account_lock_until,
+      CASE WHEN main_admin_config.admin_id = admins.id THEN 'MAIN_ADMIN' ELSE 'ADMIN' END AS effective_role
+    FROM admins LEFT JOIN main_admin_config ON main_admin_config.singleton = 1
+    ORDER BY created_at
+  `).all().map((admin) => [
+    admin.id, admin.removed_at ? 'Removed' : admin.email, admin.effective_role,
+    admin.removed_at ? 'Removed'
+      : !admin.is_verified ? 'Pending verification'
+      : admin.approval_status === 'pending' ? 'Pending approval'
+        : admin.approval_status === 'rejected' ? 'Rejected'
+          : admin.is_active ? 'Active' : 'Inactive',
+    admin.created_at, admin.last_login || '', admin.last_status_change_at || '', admin.last_password_change_at || '',
+    admin.failed_login_attempts, admin.last_successful_login || '',
+    admin.account_lock_until > Date.now() ? 'Locked' : 'Not locked'
+  ]);
+  const response = await getSheets().spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
+    range: "'Admin Accounts'!A2:K10000"
+  });
+  const existingRows = response.data.values || [];
+  for (const row of rows) {
+    const index = existingRows.findIndex((existing) => existing[0] === row[0]);
+    if (index >= 0) {
+      await getSheets().spreadsheets.values.update({
+        spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
+        range: `'Admin Accounts'!A${index + 2}:K${index + 2}`,
+        valueInputOption: 'RAW',
+        requestBody: { values: [row] }
+      });
+    } else {
+      await getSheets().spreadsheets.values.append({
+        spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
+        range: "'Admin Accounts'!A:J",
+        valueInputOption: 'RAW',
+        insertDataOption: 'INSERT_ROWS',
+        requestBody: { values: [row] }
+      });
+    }
+  }
+}
+async function syncAdminAuditSheet() {
+  await ensureSecuritySheets();
+  const response = await getSheets().spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
+    range: "'Admin Audit Log'!A2:J10000"
+  });
+  const existingRows = new Map((response.data.values || []).map((row, index) => [row[0], { row, sheetRow: index + 2 }]));
+  const updates = [];
+  const rows = [];
+  for (const entry of listAdminAuditLog(authDb, 10000).reverse()) {
+    const row = [
+      entry.id, entry.timestamp, entry.adminId, entry.adminEmail,
+      entry.action, entry.affectedRecord, entry.reason,
+      entry.actingAdminRole || 'ADMIN', entry.targetAdminId || '', entry.result || 'success'
+    ];
+    const existing = existingRows.get(entry.id);
+    if (!existing) {
+      rows.push(row);
+    } else if (row.some((value, index) => String(existing.row[index] || '') !== String(value))) {
+      updates.push({ range: `'Admin Audit Log'!A${existing.sheetRow}:J${existing.sheetRow}`, values: [row] });
+    }
+  }
+  if (updates.length) {
+    await getSheets().spreadsheets.values.batchUpdate({
+      spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
+      requestBody: { valueInputOption: 'RAW', data: updates }
+    });
+  }
+  if (rows.length) {
+    await getSheets().spreadsheets.values.append({
+      spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
+      range: "'Admin Audit Log'!A:J",
+      valueInputOption: 'RAW',
+      insertDataOption: 'INSERT_ROWS',
+      requestBody: { values: rows }
+    });
+  }
 }
 async function styleAttendanceSheets() {
   const metadata = await readSheetsMetadata('sheets.properties.title,sheets.properties.sheetId');
@@ -1122,58 +1533,34 @@ async function syncPercentage() {
 app.post('/api/auth/signup', async (req, res) => {
   const name = String(req.body.name || '').trim().replace(/\s+/g, ' ');
   const email = normalizeEmail(req.body.email);
+  const rawPhone = String(req.body.phone || '').trim();
+  const phoneDigits = rawPhone.replace(/\D/g, '');
+  const phone = rawPhone.startsWith('+') ? `+${phoneDigits}` : phoneDigits;
   const password = req.body.password;
   if (!rateLimit(`signup-ip:${req.ip}`, 20, 60 * 60 * 1000) || !rateLimit(rateLimitKey(req, 'signup', email), 5, 60 * 60 * 1000)) {
     return bad(res, 429, 'Too many signup attempts. Try again later.');
   }
   if (!/^[\p{L}\p{M}][\p{L}\p{M} .'-]{1,99}$/u.test(name) || !isValidEmail(email)) return bad(res, 400, 'Enter a valid full name and email address.');
+  if (!/^[+]?[\d\s().-]{7,24}$/.test(rawPhone) || phoneDigits.length < 7 || phoneDigits.length > 15) return bad(res, 400, 'Enter a valid phone number.');
   if (!validPassword(password) || password !== req.body.confirmPassword) return bad(res, 400, 'Enter matching passwords of at least 8 characters.');
 
-  const existing = authDb.prepare('SELECT id, password_hash, is_verified FROM admins WHERE email = ? COLLATE NOCASE').get(email);
-  if (existing?.is_verified) return bad(res, 409, 'An account with this email already exists.');
-  if (existing && existing.password_hash) return bad(res, 409, 'Signup has already started for this email. Request a new verification code.');
-  const hasAdmins = authDb.prepare('SELECT 1 AS present FROM admins LIMIT 1').get();
-  if (hasAdmins && !existing) return bad(res, 403, 'New admin accounts are invitation-only. Ask an active admin to invite you.');
+  if (authDb.prepare('SELECT 1 FROM admins WHERE email = ? COLLATE NOCASE').get(email)) return bad(res, 409, 'An account with this email already exists.');
+  if (authDb.prepare('SELECT 1 FROM admins WHERE phone = ?').get(phone)) return bad(res, 409, 'An account with this phone number already exists.');
 
   const passwordHash = await hashPassword(password);
   const now = new Date().toISOString();
-  let adminId = existing?.id;
+  const adminId = crypto.randomUUID();
   try {
-    const createAccount = authDb.transaction(() => {
-      if (adminId) {
-        const updated = authDb.prepare("UPDATE admins SET name = ?, password_hash = ?, updated_at = ? WHERE id = ? AND is_verified = 0 AND password_hash IS NULL")
-          .run(name, passwordHash, now, adminId);
-        if (updated.changes !== 1) throw new Error('This invitation has already been used. Request a new invitation.');
-      } else {
-        if (!hasAdmins && authDb.prepare('SELECT 1 AS present FROM admins LIMIT 1').get()) {
-          const error = new Error('The first admin account has already been created. Ask an active admin for an invitation.');
-          error.code = 'FIRST_ADMIN_ALREADY_CREATED';
-          throw error;
-        }
-        if (hasAdmins && !authDb.prepare('SELECT 1 AS present FROM admins WHERE email = ? COLLATE NOCASE').get(email)) {
-          const error = new Error('New admin accounts are invitation-only. Ask an active admin to invite you.');
-          error.code = 'ADMIN_INVITATION_REQUIRED';
-          throw error;
-        }
-        adminId = crypto.randomUUID();
-        authDb.prepare(`
-          INSERT INTO admins (id, name, email, password_hash, role, is_verified, is_active, created_at, updated_at)
-          VALUES (?, ?, ?, ?, 'ADMIN', 0, 1, ?, ?)
-        `).run(adminId, name, email, passwordHash, now, now);
-      }
-    });
-    createAccount();
-    const otpPurpose = existing ? 'invite' : 'verify';
-    if (!existing) await createOtp(adminId, otpPurpose);
-    res.status(201).json({ ok: true, requiresOtp: true, otpPurpose });
+    authDb.prepare(`
+      INSERT INTO admins
+        (id, name, email, phone, password_hash, role, is_verified, is_active, approval_status, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, 'ADMIN', 0, 0, 'pending', ?, ?)
+    `).run(adminId, name, email, phone, passwordHash, now, now);
+    await createOtp(adminId, 'verify');
+    res.status(201).json({ ok: true, requiresOtp: true, otpPurpose: 'verify' });
   } catch (error) {
     if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') return bad(res, 409, 'An account with this email already exists.');
-    if (error.code === 'FIRST_ADMIN_ALREADY_CREATED' || error.code === 'ADMIN_INVITATION_REQUIRED') {
-      return bad(res, 403, error.message);
-    }
-    if (!existing && adminId) authDb.prepare('DELETE FROM admins WHERE id = ? AND is_verified = 0').run(adminId);
-    if (existing && adminId) authDb.prepare("UPDATE admins SET name = '', password_hash = NULL, updated_at = ? WHERE id = ? AND is_verified = 0")
-      .run(new Date().toISOString(), adminId);
+    authDb.prepare('DELETE FROM admins WHERE id = ? AND is_verified = 0').run(adminId);
     console.error('Unable to create admin signup:', error.message);
     bad(res, 503, emailDeliveryErrorMessage(error));
   }
@@ -1185,10 +1572,18 @@ app.post('/api/auth/resend-otp', async (req, res) => {
   if (!rateLimit(`otp-ip:${req.ip}`, 10, 60 * 60 * 1000) || !rateLimit(rateLimitKey(req, 'otp-email', email), 5, 60 * 60 * 1000)) {
     return bad(res, 429, 'Too many verification requests. Try again later.');
   }
-  const admin = authDb.prepare('SELECT id, is_verified, is_active, password_hash FROM admins WHERE email = ? COLLATE NOCASE').get(email);
+  const admin = authDb.prepare(`
+    SELECT id, name, email, is_verified, is_active, password_hash, must_change_password
+    FROM admins WHERE email = ? COLLATE NOCASE
+  `).get(email);
   if (!admin) return res.json({ ok: true });
   const activeChallenge = authDb.prepare('SELECT purpose FROM otp_verifications WHERE admin_id = ?').get(admin.id);
   if (purpose === 'verify' && activeChallenge?.purpose === 'invite') purpose = 'invite';
+  const invitationActor = purpose === 'invite' ? sessionAdmin(req) : null;
+  if (purpose === 'invite' && !invitationActor) return bad(res, 401, 'Main Admin login required to resend an invitation.');
+  if (invitationActor && (invitationActor.role !== 'MAIN_ADMIN' || invitationActor.mustChangePassword)) {
+    return bad(res, 403, 'Main Admin access required to resend an invitation.');
+  }
   const validPurpose = (purpose === 'reset' && admin.is_verified && admin.is_active)
     || (purpose === 'verify' && !admin.is_verified && !!admin.password_hash)
     || (purpose === 'invite' && !admin.is_verified);
@@ -1197,9 +1592,34 @@ app.post('/api/auth/resend-otp', async (req, res) => {
   const previous = authDb.prepare('SELECT last_sent_at FROM otp_verifications WHERE admin_id = ?').get(admin.id);
   if (previous && Date.now() - previous.last_sent_at < 60_000) return bad(res, 429, 'Please wait one minute before requesting another code.');
   try {
-    await createOtp(admin.id, purpose);
+    if (purpose === 'invite') {
+      const temporaryPassword = await generateTemporaryPassword(admin.name, admin.password_hash);
+      const passwordHash = await hashPassword(temporaryPassword);
+      authDb.prepare(`
+        UPDATE admins SET password_hash = ?, must_change_password = 1, is_active = 1, updated_at = ?
+        WHERE id = ? AND is_verified = 0
+      `).run(passwordHash, new Date().toISOString(), admin.id);
+      await createOtp(admin.id, purpose, { temporaryPassword });
+    } else {
+      await createOtp(admin.id, purpose);
+    }
+    if (purpose === 'invite' && invitationActor) {
+      const now = new Date().toISOString();
+      authDb.prepare(`
+        INSERT INTO admin_audit_log
+          (id, timestamp, admin_id, acting_admin_role, target_admin_id, action, affected_record, reason, result)
+        VALUES (?, ?, ?, 'MAIN_ADMIN', ?, 'admin_invite_resend', ?, 'Main Admin resent temporary credentials and a one-time code.', 'success')
+      `).run(crypto.randomUUID(), now, invitationActor.id, admin.id, admin.email);
+      syncAdminAuditSheet().catch((error) => console.error('Unable to sync invitation resend audit to Google Sheets:', error.message));
+    }
     res.json({ ok: true, purpose });
   } catch (error) {
+    if (purpose === 'invite') {
+      authDb.prepare(`
+        UPDATE admins SET password_hash = ?, must_change_password = ?, is_active = ?, updated_at = ?
+        WHERE id = ? AND is_verified = 0
+      `).run(admin.password_hash, admin.must_change_password, admin.is_active, new Date().toISOString(), admin.id);
+    }
     console.error('Unable to send admin verification email:', error.message);
     bad(res, 503, emailDeliveryErrorMessage(error));
   }
@@ -1207,12 +1627,14 @@ app.post('/api/auth/resend-otp', async (req, res) => {
 app.post('/api/auth/verify-otp', async (req, res) => {
   const email = normalizeEmail(req.body.email);
   const code = String(req.body.code || '').trim();
-  const purpose = String(req.body.purpose || 'verify');
+  let purpose = String(req.body.purpose || 'verify');
   if (!isValidEmail(email) || !/^\d{6}$/.test(code) || !['verify', 'invite', 'reset'].includes(purpose)) {
     return bad(res, 400, 'Enter a valid email and six-digit verification code.');
   }
   if (!rateLimit(`verify-ip:${req.ip}`, 20, 60 * 60 * 1000)) return bad(res, 429, 'Too many code attempts. Try again later.');
   const admin = authDb.prepare('SELECT * FROM admins WHERE email = ? COLLATE NOCASE').get(email);
+  const activeChallenge = admin && authDb.prepare('SELECT purpose FROM otp_verifications WHERE admin_id = ?').get(admin.id);
+  if (purpose === 'verify' && activeChallenge?.purpose === 'invite') purpose = 'invite';
   const challenge = admin && authDb.prepare('SELECT * FROM otp_verifications WHERE admin_id = ? AND purpose = ?').get(admin.id, purpose);
   if (!admin || !challenge || challenge.expires_at <= Date.now()) {
     if (challenge) authDb.prepare('DELETE FROM otp_verifications WHERE id = ?').run(challenge.id);
@@ -1227,9 +1649,9 @@ app.post('/api/auth/verify-otp', async (req, res) => {
     return bad(res, 400, 'The verification code is incorrect.');
   }
 
-  const isSignup = purpose !== 'reset' && !admin.is_verified && !!admin.password_hash
+  const isSignup = purpose !== 'reset' && !admin.is_verified && !admin.must_change_password && !!admin.password_hash
     && (purpose === 'verify' || purpose === 'invite');
-  const isReset = purpose === 'reset' && !!admin.is_verified && !!admin.is_active;
+  const isReset = purpose === 'reset' && !!admin.is_verified && !admin.removed_at;
   if (!isSignup && !isReset) return bad(res, 400, 'The verification request is no longer valid.');
   let passwordHash = admin.password_hash;
   let name = admin.name;
@@ -1245,10 +1667,35 @@ app.post('/api/auth/verify-otp', async (req, res) => {
     authDb.prepare('UPDATE otp_verifications SET verified = 1 WHERE id = ?').run(challenge.id);
     authDb.prepare('DELETE FROM otp_verifications WHERE id = ?').run(challenge.id);
     authDb.prepare(`
-      UPDATE admins SET name = ?, password_hash = ?, is_verified = 1, updated_at = ?
+      UPDATE admins SET name = ?, password_hash = ?, is_verified = 1,
+        is_active = CASE
+        WHEN ? = 1 AND (
+          id = (SELECT admin_id FROM main_admin_config WHERE singleton = 1)
+          OR approval_status = 'approved'
+        ) THEN 1
+        ELSE is_active
+      END,
+        approval_status = CASE WHEN id = (SELECT admin_id FROM main_admin_config WHERE singleton = 1) THEN 'approved' ELSE approval_status END,
+        must_change_password = CASE WHEN ? = 1 THEN 0 ELSE must_change_password END,
+        last_password_change_at = CASE WHEN ? = 1 THEN ? ELSE COALESCE(last_password_change_at, ?) END,
+        updated_at = ?
       WHERE id = ? AND role = 'ADMIN'
-    `).run(name, passwordHash, now, admin.id);
+    `).run(name, passwordHash, isSignup ? 1 : 0, isReset ? 1 : 0, isReset ? 1 : 0, now, now, now, admin.id);
+    if (purpose === 'verify' && authDb.prepare('SELECT admin_id FROM main_admin_config WHERE singleton = 1').get()?.admin_id === admin.id) {
+      authDb.prepare('UPDATE admins SET last_status_change_at = ? WHERE id = ?').run(now, admin.id);
+      authDb.prepare(`
+        INSERT INTO admin_audit_log
+          (id, timestamp, admin_id, acting_admin_role, target_admin_id, action, affected_record, reason, result)
+        VALUES (?, ?, ?, 'MAIN_ADMIN', ?, 'main_admin_bootstrap', ?, 'Main Admin email verified during one-time bootstrap.', 'success')
+      `).run(crypto.randomUUID(), now, admin.id, admin.id, admin.id);
+    }
     if (isReset) authDb.prepare('DELETE FROM auth_sessions WHERE admin_id = ?').run(admin.id);
+    if (isReset) {
+      authDb.prepare(`
+        UPDATE admins SET failed_login_attempts = 0, account_lock_until = NULL
+        WHERE id = ?
+      `).run(admin.id);
+    }
   });
   completeVerification();
   let emailNotification = 'not-requested';
@@ -1256,14 +1703,34 @@ app.post('/api/auth/verify-otp', async (req, res) => {
     if (!isEmailConfigured()) emailNotification = 'not-configured';
     else {
       try {
-        await sendWelcomeEmail({ to: admin.email, name, email: admin.email, role: admin.role });
+        await sendWelcomeEmail({
+          to: admin.email,
+          name,
+          email: admin.email,
+          role: admin.role,
+          approvalPending: admin.approval_status === 'pending'
+        });
         emailNotification = 'sent';
       } catch {
         emailNotification = 'failed';
       }
     }
   }
-  res.json({ ok: true, emailNotification });
+  let accountReportSync = 'synced';
+  for (const sync of [syncAdminAccountsSheet, syncAdminAuditSheet]) {
+    try {
+      await sync();
+    } catch (error) {
+      accountReportSync = 'failed';
+      console.error('Admin verification was completed, but an admin report could not be synchronized:', error.message);
+    }
+  }
+  res.json({
+    ok: true,
+    emailNotification,
+    accountReportSync,
+    approvalPending: isSignup && admin.approval_status === 'pending'
+  });
 });
 app.post('/api/auth/login', async (req, res) => {
   const email = normalizeEmail(req.body.email);
@@ -1272,11 +1739,14 @@ app.post('/api/auth/login', async (req, res) => {
   if (!rateLimit(ipKey, 30, 15 * 60 * 1000) || !rateLimit(emailKey, 8, 15 * 60 * 1000)) {
     return bad(res, 429, 'Too many login attempts. Try again in 15 minutes.');
   }
-  const admin = isValidEmail(email) && validPassword(req.body.password)
+  const admin = isValidEmail(email)
     ? authDb.prepare('SELECT * FROM admins WHERE email = ? COLLATE NOCASE').get(email)
     : null;
+  if (admin?.account_lock_until > Date.now()) {
+    return bad(res, 429, 'This admin account is temporarily locked after repeated failed sign-in attempts. Try again in 15 minutes.');
+  }
   let passwordMatches = false;
-  if (admin?.password_hash?.startsWith('scrypt$')) {
+  if (validPassword(req.body.password) && admin?.password_hash?.startsWith('scrypt$')) {
     const [, salt, expectedHex] = admin.password_hash.split('$');
     const candidate = await scrypt(req.body.password, salt, 64);
     const expected = Buffer.from(expectedHex, 'hex');
@@ -1285,20 +1755,154 @@ app.post('/api/auth/login', async (req, res) => {
       const migratedHash = await hashPassword(req.body.password);
       authDb.prepare('UPDATE admins SET password_hash = ?, updated_at = ? WHERE id = ?').run(migratedHash, new Date().toISOString(), admin.id);
     }
-  } else if (admin?.password_hash) {
+  } else if (validPassword(req.body.password) && admin?.password_hash) {
     passwordMatches = await verifyStoredPassword(req.body.password, admin.password_hash);
   } else {
     await bcrypt.compare(passwordDigest(String(req.body.password || '')), dummyPasswordHash);
   }
-  if (!admin || !passwordMatches || !admin.is_verified || !admin.is_active || admin.role !== 'ADMIN') {
+  if (admin && passwordMatches && admin.approval_status === 'pending') {
+    return bad(res, 403, 'Your account is waiting for Main Admin approval before signing in.');
+  }
+  if (!admin || !passwordMatches) {
+    if (admin) {
+      const attempts = admin.failed_login_attempts + 1;
+      const lockedUntil = attempts >= 8 ? Date.now() + 15 * 60 * 1000 : null;
+      authDb.prepare(`
+        UPDATE admins
+        SET failed_login_attempts = ?, account_lock_until = ?
+        WHERE id = ?
+      `).run(lockedUntil ? 0 : attempts, lockedUntil, admin.id);
+    }
     return bad(res, 401, 'Invalid email or password, or account is not verified or active.');
+  }
+  if (admin.approval_status !== 'approved' || admin.removed_at || admin.role !== 'ADMIN') {
+    return bad(res, 401, 'Invalid email or password, or account is not verified or active.');
+  }
+  const needsEmailVerification = !admin.is_verified && !admin.must_change_password;
+  if (!admin.is_active && !needsEmailVerification) {
+    return bad(res, 403, 'This admin account is inactive. Contact the Main Admin for assistance.');
+  }
+  if (admin.must_change_password || needsEmailVerification) {
+    const challengePurpose = admin.must_change_password ? 'invite' : 'verify';
+    const challenge = authDb.prepare(`
+      SELECT * FROM otp_verifications WHERE admin_id = ? AND purpose = ?
+    `).get(admin.id, challengePurpose);
+    if (!req.body.otp) return bad(res, 428, 'Enter the one-time code sent to your email to continue signing in.');
+    if (!/^\d{6}$/.test(String(req.body.otp)) || !challenge || challenge.expires_at <= Date.now() || challenge.attempts >= 5) {
+      if (challenge?.expires_at <= Date.now() || challenge?.attempts >= 5) {
+        authDb.prepare('DELETE FROM otp_verifications WHERE id = ?').run(challenge.id);
+      }
+      return bad(res, 401, 'The one-time code is invalid or expired. Ask the Main Admin to resend your verification code.');
+    }
+    if (!(await bcrypt.compare(String(req.body.otp), challenge.otp_hash))) {
+      const attempts = challenge.attempts + 1;
+      if (attempts >= 5) authDb.prepare('DELETE FROM otp_verifications WHERE id = ?').run(challenge.id);
+      else authDb.prepare('UPDATE otp_verifications SET attempts = ? WHERE id = ?').run(attempts, challenge.id);
+      return bad(res, 401, 'The one-time code is incorrect.');
+    }
+    const now = new Date().toISOString();
+    try {
+      authDb.transaction(() => {
+        const consumed = authDb.prepare(`
+          UPDATE otp_verifications SET verified = 1
+          WHERE id = ? AND admin_id = ? AND purpose = ? AND verified = 0
+            AND expires_at > ? AND attempts < 5
+        `).run(challenge.id, admin.id, challengePurpose, Date.now());
+        if (consumed.changes !== 1) throw new Error('The invitation code has already been used or expired.');
+        const verified = authDb.prepare(`
+          UPDATE admins SET is_verified = 1, is_active = 1, updated_at = ?
+          WHERE id = ? AND must_change_password = ? AND is_verified = 0
+            AND approval_status = 'approved' AND removed_at IS NULL
+            AND (is_active = 1 OR ? = 0)
+        `).run(now, admin.id, admin.must_change_password ? 1 : 0, admin.must_change_password ? 1 : 0);
+        if (verified.changes !== 1) throw new Error('This invitation is no longer valid.');
+        authDb.prepare('DELETE FROM otp_verifications WHERE id = ?').run(challenge.id);
+        authDb.prepare(`
+          INSERT INTO admin_audit_log
+            (id, timestamp, admin_id, acting_admin_role, target_admin_id, action, affected_record, reason, result)
+          VALUES (?, ?, ?, 'ADMIN', ?, ?, ?, ?, 'success')
+        `).run(
+          crypto.randomUUID(),
+          now,
+          admin.id,
+          admin.id,
+          challengePurpose === 'invite' ? 'admin_invite_login' : 'admin_email_verified_login',
+          admin.email,
+          challengePurpose === 'invite'
+            ? 'First sign-in verified with invitation code; password change required.'
+            : 'Email verified with one-time code during sign-in.'
+        );
+      })();
+    } catch {
+      return bad(res, 401, 'The one-time code has already been used, expired, or is no longer valid.');
+    }
+    admin.is_verified = 1;
+    admin.is_active = 1;
   }
   authRateLimits.delete(ipKey);
   authRateLimits.delete(emailKey);
-  authDb.prepare('UPDATE admins SET last_login = ? WHERE id = ?').run(new Date().toISOString(), admin.id);
+  const loggedInAt = new Date().toISOString();
+  authDb.prepare(`
+    UPDATE admins SET last_login = ?, last_successful_login = ?,
+      failed_login_attempts = 0, account_lock_until = NULL
+    WHERE id = ?
+  `).run(loggedInAt, loggedInAt, admin.id);
+  authDb.prepare(`
+    INSERT INTO admin_audit_log
+      (id, timestamp, admin_id, acting_admin_role, target_admin_id, action, affected_record, reason, result)
+    SELECT ?, ?, admins.id,
+      CASE WHEN main_admin_config.admin_id = admins.id THEN 'MAIN_ADMIN' ELSE 'ADMIN' END,
+      admins.id, 'admin_login', admins.email, 'Successful administrator login.', 'success'
+    FROM admins CROSS JOIN main_admin_config WHERE admins.id = ?
+  `).run(crypto.randomUUID(), loggedInAt, admin.id);
   const cookie = instructorCookie(admin.id);
   res.setHeader('Set-Cookie', `instructor=${cookie}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800${process.env.NODE_ENV === 'production' ? '; Secure' : ''}`);
-  res.json({ ok: true });
+  res.json({ ok: true, mustChangePassword: !!admin.must_change_password });
+  Promise.all([
+    syncAdminAccountsSheet().catch((error) => console.error('Unable to sync admin login report to Google Sheets:', error.message)),
+    syncAdminAuditSheet().catch((error) => console.error('Unable to sync admin audit report to Google Sheets:', error.message))
+  ]);
+});
+app.post('/api/auth/change-password', async (req, res) => {
+  const admin = sessionAdmin(req);
+  if (!admin) return bad(res, 401, 'Admin login required.');
+  if (!admin.mustChangePassword) return bad(res, 409, 'A temporary password change is not pending.');
+  if (!validPassword(req.body.password) || req.body.password !== req.body.confirmPassword) {
+    return bad(res, 400, 'Enter matching passwords of at least 8 characters.');
+  }
+  const storedPassword = authDb.prepare('SELECT password_hash FROM admins WHERE id = ?').get(admin.id)?.password_hash;
+  if (storedPassword && await verifyStoredPassword(req.body.password, storedPassword)) {
+    return bad(res, 400, 'Choose a new password different from the temporary password.');
+  }
+  const now = new Date().toISOString();
+  const raw = req.headers.cookie?.match(/(?:^|; )instructor=([^;]+)/)?.[1];
+  const sessionId = raw?.slice(0, raw.lastIndexOf('.'));
+  if (!sessionId) return bad(res, 401, 'Admin login required.');
+  const currentSessionHash = crypto.createHash('sha256').update(sessionId).digest('hex');
+  try {
+    const passwordHash = await hashPassword(req.body.password);
+    authDb.transaction(() => {
+      const updated = authDb.prepare(`
+        UPDATE admins SET password_hash = ?, must_change_password = 0, last_password_change_at = ?, updated_at = ?
+        WHERE id = ? AND must_change_password = 1 AND is_active = 1 AND removed_at IS NULL
+      `).run(passwordHash, now, now, admin.id);
+      if (updated.changes !== 1) throw new Error('Temporary password change is no longer pending.');
+      authDb.prepare('DELETE FROM auth_sessions WHERE admin_id = ? AND token_hash != ?').run(admin.id, currentSessionHash);
+      authDb.prepare(`
+        INSERT INTO admin_audit_log
+          (id, timestamp, admin_id, acting_admin_role, target_admin_id, action, affected_record, reason, result)
+        VALUES (?, ?, ?, 'ADMIN', ?, 'admin_password_change', ?, 'Temporary password changed after first sign-in.', 'success')
+      `).run(crypto.randomUUID(), now, admin.id, admin.id, admin.email);
+    })();
+    res.json({ ok: true });
+    Promise.all([
+      syncAdminAccountsSheet().catch((error) => console.error('Unable to sync admin password change to Google Sheets:', error.message)),
+      syncAdminAuditSheet().catch((error) => console.error('Unable to sync admin password change audit to Google Sheets:', error.message))
+    ]);
+  } catch (error) {
+    console.error('Unable to change temporary admin password:', error.message);
+    bad(res, 500, 'Unable to change the temporary password. Please try again.');
+  }
 });
 app.post('/api/auth/logout', (req, res) => {
   const raw = req.headers.cookie?.match(/(?:^|; )instructor=([^;]+)/)?.[1];
@@ -1309,65 +1913,444 @@ app.post('/api/auth/logout', (req, res) => {
 });
 app.get('/api/me', (req, res) => {
   const admin = sessionAdmin(req);
-  res.json({ instructor: !!admin, admin: admin ? { id: admin.id, name: admin.name, email: admin.email, role: admin.role } : null });
+  res.json({
+    instructor: !!admin,
+    admin: admin ? {
+      id: admin.id,
+      name: admin.name,
+      email: admin.email,
+      role: admin.role,
+      mustChangePassword: !!admin.mustChangePassword
+    } : null
+  });
 });
 app.get('/api/auth/status', (req, res) => {
   const hasAdmins = !!authDb.prepare('SELECT 1 AS present FROM admins LIMIT 1').get();
+  const mainAdmin = authDb.prepare(`
+    SELECT main_admin_config.admin_id, admins.is_verified
+    FROM main_admin_config
+    LEFT JOIN admins ON admins.id = main_admin_config.admin_id
+    WHERE main_admin_config.singleton = 1
+  `).get();
+  const pendingMainAdminVerification = !!mainAdmin?.admin_id && !mainAdmin.is_verified;
   res.json({
-    firstAdminSetupRequired: !hasAdmins,
-    inviteOnly: hasAdmins
+    firstAdminSetupRequired: !mainAdmin?.admin_id,
+    bootstrapMode: hasAdmins ? 'claim' : 'create',
+    bootstrapAvailable: mainAdminBootstrapSecret.length >= 32,
+    pendingMainAdminVerification
   });
 });
-app.get('/api/admins', requireInstructor, (req, res) => {
+app.post('/api/auth/bootstrap', async (req, res) => {
+  if (!rateLimit(`bootstrap-ip:${req.ip}`, 5, 60 * 60 * 1000)) return bad(res, 429, 'Too many bootstrap attempts. Try again later.');
+  if (!bootstrapSecretMatches(req.body.bootstrapSecret)) return bad(res, 403, 'The Main Admin bootstrap secret is invalid or not configured.');
+  const email = normalizeEmail(req.body.email);
+  const existingAdmin = isValidEmail(email)
+    ? authDb.prepare('SELECT * FROM admins WHERE email = ? COLLATE NOCASE').get(email)
+    : null;
+  const mainAdminId = authDb.prepare('SELECT admin_id FROM main_admin_config WHERE singleton = 1').get()?.admin_id;
+  if (mainAdminId) return bad(res, 409, 'Main Admin setup has already been completed.');
+
+  if (existingAdmin) {
+    if (!existingAdmin.is_verified || !existingAdmin.is_active || existingAdmin.removed_at || !existingAdmin.password_hash) {
+      return bad(res, 403, 'Use an existing verified, active admin account to claim Main Admin access.');
+    }
+    const passwordMatches = existingAdmin.password_hash.startsWith('scrypt$')
+      ? await (async () => {
+        const [, salt, expectedHex] = existingAdmin.password_hash.split('$');
+        const candidate = await scrypt(String(req.body.password || ''), salt, 64);
+        const expected = Buffer.from(expectedHex, 'hex');
+        return candidate.length === expected.length && crypto.timingSafeEqual(candidate, expected);
+      })()
+      : await verifyStoredPassword(String(req.body.password || ''), existingAdmin.password_hash);
+    if (!passwordMatches) return bad(res, 401, 'The existing admin password is incorrect.');
+    const now = new Date().toISOString();
+    try {
+      authDb.transaction(() => {
+        const claimed = authDb.prepare(`
+          UPDATE main_admin_config SET admin_id = ?, created_at = ?
+          WHERE singleton = 1 AND admin_id IS NULL
+        `).run(existingAdmin.id, now);
+        if (claimed.changes !== 1) throw new Error('Main Admin setup has already been completed.');
+        authDb.prepare(`
+          INSERT INTO admin_audit_log
+            (id, timestamp, admin_id, acting_admin_role, target_admin_id, action, affected_record, reason, result)
+          VALUES (?, ?, ?, 'MAIN_ADMIN', ?, 'main_admin_bootstrap', ?, ?, 'success')
+        `).run(crypto.randomUUID(), now, existingAdmin.id, existingAdmin.id, existingAdmin.email, 'Main Admin claimed using the one-time bootstrap secret.');
+      })();
+    } catch (error) {
+      return bad(res, 409, error.message);
+    }
+    const reportResults = await Promise.all(
+      [syncAdminAccountsSheet, syncAdminAuditSheet].map((sync) => sync()
+        .then(() => true)
+        .catch((error) => {
+          console.error('Main Admin was assigned, but its Google Sheets report could not be synchronized:', error.message);
+          return false;
+        }))
+    );
+    return res.json({
+      ok: true,
+      requiresOtp: false,
+      claimedExistingAccount: true,
+      accountReportSync: reportResults.every(Boolean) ? 'synced' : 'failed'
+    });
+  }
+
+  const name = String(req.body.name || '').trim().replace(/\s+/g, ' ');
+  if (!/^[\p{L}\p{M}][\p{L}\p{M} .'-]{1,99}$/u.test(name) || !isValidEmail(email)) return bad(res, 400, 'Enter a valid full name and email address.');
+  if (!validPassword(req.body.password) || req.body.password !== req.body.confirmPassword) return bad(res, 400, 'Enter matching passwords of at least 8 characters.');
+  const now = new Date().toISOString();
+  const adminId = crypto.randomUUID();
+  const passwordHash = await hashPassword(req.body.password);
+  try {
+    authDb.transaction(() => {
+      if (authDb.prepare('SELECT 1 AS present FROM main_admin_config WHERE singleton = 1 AND admin_id IS NOT NULL').get()) {
+        throw new Error('Main Admin setup has already been completed.');
+      }
+      if (authDb.prepare('SELECT 1 AS present FROM admins LIMIT 1').get()) {
+        const error = new Error('An existing admin account must claim Main Admin setup.');
+        error.code = 'MAIN_ADMIN_ALREADY_INITIALIZED';
+        throw error;
+      }
+      authDb.prepare(`
+        INSERT INTO admins
+          (id, name, email, password_hash, role, is_verified, is_active, created_at, updated_at, last_password_change_at, last_status_change_at)
+        VALUES (?, ?, ?, ?, 'ADMIN', 0, 0, ?, ?, ?, ?)
+      `).run(adminId, name, email, passwordHash, now, now, now, now);
+      const claimed = authDb.prepare(`
+        UPDATE main_admin_config SET admin_id = ?, created_at = ?
+        WHERE singleton = 1 AND admin_id IS NULL
+      `).run(adminId, now);
+      if (claimed.changes !== 1) {
+        const error = new Error('Main Admin setup has already been completed.');
+        error.code = 'MAIN_ADMIN_ALREADY_INITIALIZED';
+        throw error;
+      }
+    })();
+    await createOtp(adminId, 'verify');
+    res.status(201).json({ ok: true, requiresOtp: true, otpPurpose: 'verify' });
+  } catch (error) {
+    if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') return bad(res, 409, 'An account with this email already exists.');
+    if (error.code === 'MAIN_ADMIN_ALREADY_INITIALIZED') return bad(res, 409, error.message);
+    authDb.transaction(() => {
+      authDb.prepare('UPDATE main_admin_config SET admin_id = NULL, created_at = NULL WHERE singleton = 1 AND admin_id = ?').run(adminId);
+      authDb.prepare('DELETE FROM admins WHERE id = ? AND is_verified = 0').run(adminId);
+    })();
+    console.error('Unable to initialize Main Admin:', error.message);
+    return bad(res, 503, emailDeliveryErrorMessage(error));
+  }
+});
+app.get('/api/admins', requireInstructor, requireMainAdmin, (req, res) => {
   const admins = authDb.prepare(`
-    SELECT id, name, email, role, is_verified AS isVerified, is_active AS isActive,
-      created_at AS createdAt, updated_at AS updatedAt, last_login AS lastLogin
-    FROM admins ORDER BY created_at
+    SELECT admins.id, admins.name, admins.email,
+    admins.phone, admins.approval_status AS approvalStatus,
+    CASE WHEN main_admin_config.admin_id = admins.id THEN 'MAIN_ADMIN' ELSE 'ADMIN' END AS role,
+      admins.is_verified AS isVerified, admins.is_active AS isActive, admins.removed_at AS removedAt,
+      admins.created_at AS createdAt, admins.updated_at AS updatedAt, admins.last_login AS lastLogin,
+      admins.last_status_change_at AS lastStatusChangeAt,
+      admins.last_password_change_at AS lastPasswordChangeAt,
+      admins.failed_login_attempts AS failedLoginAttempts,
+      admins.last_successful_login AS lastSuccessfulLogin,
+      admins.account_lock_until AS accountLockUntil
+    FROM admins CROSS JOIN main_admin_config
+    WHERE admins.removed_at IS NULL
+    ORDER BY admins.created_at
   `).all().map((admin) => ({
     ...admin,
+    ...(admin.removedAt ? {
+      name: 'Removed admin',
+      email: 'Removed',
+      phone: null,
+      lastLogin: null,
+      lastPasswordChangeAt: null,
+      lastSuccessfulLogin: null,
+      failedLoginAttempts: 0,
+      accountLockUntil: null
+    } : {}),
     isVerified: !!admin.isVerified,
-    isActive: !!admin.isActive
+    isActive: !!admin.isActive,
+    accountLockStatus: admin.accountLockUntil > Date.now() ? 'Locked' : 'Not locked',
+    status: admin.removedAt ? 'Removed'
+      : admin.approvalStatus === 'pending' ? (admin.isVerified ? 'Pending approval' : 'Pending verification')
+        : admin.approvalStatus === 'rejected' ? 'Rejected'
+          : !admin.isVerified ? (admin.isActive ? 'Pending verification' : 'Pending verification · Access approved')
+            : admin.isActive ? 'Active' : 'Inactive',
+    subjects: assignedSubjects({ id: admin.id, role: admin.role })
   }));
   res.json(admins);
 });
-app.post('/api/admins/invite', requireInstructor, async (req, res) => {
+app.get('/api/admins/pending', requireInstructor, requireMainAdmin, (req, res) => {
+  const pending = authDb.prepare(`
+    SELECT id, name, email, phone, created_at AS createdAt, is_verified AS isVerified,
+      approval_status AS approvalStatus
+    FROM admins
+    WHERE role = 'ADMIN' AND removed_at IS NULL
+      AND (approval_status = 'pending' OR (approval_status = 'approved' AND is_verified = 0))
+    ORDER BY created_at
+  `).all().map((admin) => ({
+    ...admin,
+    isVerified: !!admin.isVerified,
+    canReview: !!admin.isVerified && admin.approvalStatus === 'pending',
+    reviewStatus: !admin.isVerified
+      ? 'Awaiting email verification'
+      : admin.approvalStatus === 'pending' ? 'Pending Main Admin approval' : 'Awaiting first sign-in'
+  }));
+  res.json(pending);
+});
+app.post('/api/admins/:id/approval', requireInstructor, requireMainAdmin, async (req, res) => {
+  const decision = String(req.body.decision || '');
+  const reason = String(req.body.reason || 'Main Admin granted access from the administrator list.').trim();
+  if (!['approve', 'reject'].includes(decision)) return bad(res, 400, 'Choose approve or reject.');
+  if (reason.length < 5 || reason.length > 500) return bad(res, 400, 'Enter a reason between 5 and 500 characters.');
+  const now = new Date().toISOString();
+  let grantResult;
+  try {
+    grantResult = authDb.transaction(() => {
+      const target = authDb.prepare(`
+        SELECT id, email, is_verified, is_active, approval_status
+        FROM admins WHERE id = ? AND role = 'ADMIN' AND removed_at IS NULL
+      `).get(req.params.id);
+      if (!target || (target.approval_status !== 'pending' && !target.is_verified)) {
+        throw new Error('This pending regular admin was not found.');
+      }
+      if (decision === 'approve' && target.approval_status === 'approved'
+        && assignedSubjects({ id: target.id, role: 'ADMIN' }).length === subjects.length) {
+        return { alreadyGranted: true, isVerified: !!target.is_verified, isActive: !!target.is_active };
+      }
+      const status = decision === 'approve' ? 'approved' : 'rejected';
+      const active = decision === 'approve' && target.is_verified ? 1 : 0;
+      const changed = authDb.prepare(`
+        UPDATE admins SET approval_status = ?, is_active = ?, approval_reviewed_at = ?,
+          approval_reviewed_by = ?, last_status_change_at = ?, updated_at = ?
+        WHERE id = ? AND role = 'ADMIN' AND removed_at IS NULL
+          AND (approval_status = 'pending' OR is_verified = 0)
+      `).run(status, active, now, req.admin.id, now, now, target.id);
+      if (changed.changes !== 1) throw new Error('This admin has already been reviewed.');
+      authDb.prepare('DELETE FROM admin_subject_assignments WHERE admin_id = ?').run(target.id);
+      if (decision === 'approve') {
+        const assign = authDb.prepare('INSERT INTO admin_subject_assignments (admin_id, subject, assigned_at, assigned_by) VALUES (?, ?, ?, ?)');
+        for (const subject of subjects) assign.run(target.id, subject, now, req.admin.id);
+      }
+      authDb.prepare(`
+        INSERT INTO admin_audit_log
+          (id, timestamp, admin_id, acting_admin_role, target_admin_id, action, affected_record, reason, result)
+        VALUES (?, ?, ?, 'MAIN_ADMIN', ?, ?, ?, ?, 'success')
+      `).run(crypto.randomUUID(), now, req.admin.id, target.id, `admin_${decision}`, target.email, reason);
+      if (decision === 'reject') authDb.prepare('DELETE FROM auth_sessions WHERE admin_id = ?').run(target.id);
+      return { alreadyGranted: false, isVerified: !!target.is_verified, isActive: !!active };
+    })();
+  } catch (error) {
+    return bad(res, error.message.includes('already been reviewed') ? 409 : 404, error.message);
+  }
+  if (grantResult.alreadyGranted) {
+    return res.json({
+      ok: true,
+      approvalStatus: 'approved',
+      active: grantResult.isActive,
+      requiresOtp: !grantResult.isVerified,
+      alreadyGranted: true
+    });
+  }
+  Promise.all([
+    syncAdminAccountsSheet().catch((error) => console.error('Unable to sync approval to admin report:', error.message)),
+    syncAdminAuditSheet().catch((error) => console.error('Unable to sync approval audit:', error.message))
+  ]);
+  let otpDelivery = 'not-required';
+  let otpDeliveryMessage;
+  if (decision === 'approve' && !grantResult.isVerified) {
+    try {
+      await createOtp(req.params.id, 'verify');
+      otpDelivery = 'sent';
+    } catch (error) {
+      otpDelivery = isEmailConfigured() ? 'failed' : 'not-configured';
+      otpDeliveryMessage = emailDeliveryErrorMessage(error);
+      console.error('Admin access was approved, but its verification OTP could not be sent:', error.message);
+    }
+  }
+  res.json({
+    ok: true,
+    approvalStatus: decision === 'approve' ? 'approved' : 'rejected',
+    active: grantResult.isActive,
+    requiresOtp: !grantResult.isVerified,
+    otpDelivery,
+    ...(otpDeliveryMessage ? { otpDeliveryMessage } : {})
+  });
+});
+app.put('/api/admins/:id/subjects', requireInstructor, requireMainAdmin, (req, res) => {
+  const selectedSubjects = req.body.subjects;
+  const reason = String(req.body.reason || '').trim();
+  if (!Array.isArray(selectedSubjects) || selectedSubjects.some((subject) => typeof subject !== 'string' || !subjects.includes(subject))
+    || new Set(selectedSubjects).size !== selectedSubjects.length) {
+    return bad(res, 400, 'Choose valid subjects.');
+  }
+  if (reason.length < 5 || reason.length > 500) return bad(res, 400, 'Enter a reason between 5 and 500 characters.');
+  const now = new Date().toISOString();
+  try {
+    authDb.transaction(() => {
+      const target = authDb.prepare(`
+        SELECT admins.id, admins.email FROM admins
+        LEFT JOIN main_admin_config ON main_admin_config.singleton = 1
+        WHERE admins.id = ? AND admins.removed_at IS NULL
+          AND admins.id != main_admin_config.admin_id
+          AND admins.approval_status = 'approved' AND admins.is_verified = 1
+      `).get(req.params.id);
+      if (!target) throw new Error('Approved regular admin not found.');
+      authDb.prepare('DELETE FROM admin_subject_assignments WHERE admin_id = ?').run(target.id);
+      const assign = authDb.prepare('INSERT INTO admin_subject_assignments (admin_id, subject, assigned_at, assigned_by) VALUES (?, ?, ?, ?)');
+      for (const subject of selectedSubjects) assign.run(target.id, subject, now, req.admin.id);
+      authDb.prepare(`
+        INSERT INTO admin_audit_log
+          (id, timestamp, admin_id, acting_admin_role, target_admin_id, action, affected_record, reason, result)
+        VALUES (?, ?, ?, 'MAIN_ADMIN', ?, 'admin_subjects_updated', ?, ?, 'success')
+      `).run(crypto.randomUUID(), now, req.admin.id, target.id, target.email, `${reason} Subject access: ${selectedSubjects.join(', ') || 'none'}.`);
+      if (!selectedSubjects.length) authDb.prepare('DELETE FROM auth_sessions WHERE admin_id = ?').run(target.id);
+    })();
+  } catch (error) {
+    return bad(res, 404, error.message);
+  }
+  res.json({ ok: true, subjects: selectedSubjects });
+});
+app.get('/api/admins/devices', requireInstructor, (req, res) => {
+  res.json(listDeviceRegistry(authDb).map(({ deviceHash, ...record }) => record));
+});
+app.get('/api/admins/audit-log', requireInstructor, (req, res) => {
+  res.json(listAdminAuditLog(authDb, 200, 'devices'));
+});
+app.get('/api/admins/account-audit-log', requireInstructor, requireMainAdmin, (req, res) => {
+  res.json(listAdminAuditLog(authDb, 500, 'accounts'));
+});
+app.post('/api/admins/devices/:id/unlock', requireInstructor, async (req, res) => {
+  const reason = String(req.body.reason || '').trim();
+  if (req.body.confirm !== true) return bad(res, 400, 'Confirm the device unlock before continuing.');
+  if (reason.length < 5 || reason.length > 500) return bad(res, 400, 'Enter an unlock reason between 5 and 500 characters.');
+  const unlocked = unlockDevice(authDb, {
+    id: req.params.id,
+    adminId: req.admin.id,
+    actingAdminRole: req.admin.role,
+    reason
+  });
+  if (!unlocked) return bad(res, 404, 'Active device registration not found.');
+
+  const syncErrors = [];
+  const deviceRecord = listDeviceRegistry(authDb).find((record) => record.id === unlocked.id);
+  const syncOperations = [syncAdminAuditSheet];
+  if (deviceRecord) syncOperations.unshift(() => upsertDeviceRegistrySheetRow(deviceRecord));
+  for (const sync of syncOperations) {
+    try {
+      await sync();
+    } catch (error) {
+      console.error('Unable to sync admin device unlock to Google Sheets:', error.message);
+      syncErrors.push(error.message);
+    }
+  }
+  res.json({
+    ok: true,
+    registrySync: syncErrors.length ? 'failed' : 'synced'
+  });
+});
+app.post('/api/admins/invite', requireInstructor, requireMainAdmin, async (req, res) => {
   const name = String(req.body.name || '').trim().replace(/\s+/g, ' ');
   const email = normalizeEmail(req.body.email);
+  const selectedSubjects = req.body.subjects;
   if (!/^[\p{L}\p{M}][\p{L}\p{M} .'-]{1,99}$/u.test(name) || !isValidEmail(email)) return bad(res, 400, 'Enter a valid full name and email address.');
+  if (req.body.role !== undefined && req.body.role !== 'ADMIN') return bad(res, 400, 'Only regular ADMIN accounts can be created.');
+  if (!Array.isArray(selectedSubjects) || !selectedSubjects.length
+    || selectedSubjects.some((subject) => typeof subject !== 'string' || !subjects.includes(subject))
+    || new Set(selectedSubjects).size !== selectedSubjects.length) {
+    return bad(res, 400, 'Select at least one valid subject for this admin.');
+  }
   if (!rateLimit(`invite:${req.ip}:${req.admin.id}`, 20, 60 * 60 * 1000)) return bad(res, 429, 'Too many invitations. Try again later.');
   if (authDb.prepare('SELECT 1 AS present FROM admins WHERE email = ? COLLATE NOCASE').get(email)) {
     return bad(res, 409, 'An admin account or invitation already exists for this email.');
   }
   const now = new Date().toISOString();
   const id = crypto.randomUUID();
+  const temporaryPassword = await generateTemporaryPassword(name);
+  const passwordHash = await hashPassword(temporaryPassword);
   authDb.prepare(`
-    INSERT INTO admins (id, name, email, password_hash, role, is_verified, is_active, created_at, updated_at)
-    VALUES (?, ?, ?, NULL, 'ADMIN', 0, 1, ?, ?)
-  `).run(id, name, email, now, now);
+    INSERT INTO admins
+      (id, name, email, password_hash, role, is_verified, is_active, must_change_password, created_at, updated_at, last_status_change_at)
+    VALUES (?, ?, ?, ?, 'ADMIN', 0, 1, 1, ?, ?, ?)
+  `).run(id, name, email, passwordHash, now, now, now);
+  const assignInvitedSubject = authDb.prepare(`
+    INSERT INTO admin_subject_assignments (admin_id, subject, assigned_at, assigned_by)
+    VALUES (?, ?, ?, ?)
+  `);
+  for (const subject of selectedSubjects) assignInvitedSubject.run(id, subject, now, req.admin.id);
   try {
-    await createOtp(id, 'invite');
-    res.status(201).json({ ok: true });
+    await createOtp(id, 'invite', { temporaryPassword });
+    authDb.prepare(`
+      INSERT INTO admin_audit_log
+        (id, timestamp, admin_id, acting_admin_role, target_admin_id, action, affected_record, reason, result)
+      VALUES (?, ?, ?, 'MAIN_ADMIN', ?, 'admin_invite', ?, ?, 'success')
+    `).run(
+      crypto.randomUUID(), now, req.admin.id, id, email,
+      `Regular admin invitation sent with temporary credentials and one-time code. Subject access: ${selectedSubjects.join(', ')}.`
+    );
+    let accountReportSync = 'synced';
+    for (const sync of [syncAdminAccountsSheet, syncAdminAuditSheet]) {
+      try {
+        await sync();
+      } catch (syncError) {
+        accountReportSync = 'failed';
+        console.error('Admin invitation was created, but an admin report could not be synchronized:', syncError.message);
+      }
+    }
+    res.status(201).json({ ok: true, accountReportSync });
   } catch (error) {
     authDb.prepare('DELETE FROM admins WHERE id = ? AND is_verified = 0').run(id);
     console.error('Unable to send admin invitation:', error.message);
     bad(res, 503, emailDeliveryErrorMessage(error));
   }
 });
-app.patch('/api/admins/:id/status', requireInstructor, async (req, res) => {
+app.patch('/api/admins/:id/status', requireInstructor, requireMainAdmin, async (req, res) => {
   const { active } = req.body;
+  if (req.body.confirm !== true) return bad(res, 400, 'Confirm the account status change before continuing.');
   if (typeof active !== 'boolean') return bad(res, 400, 'Admin status must be active or inactive.');
-  const target = authDb.prepare('SELECT id, name, email, role, is_active FROM admins WHERE id = ?').get(req.params.id);
-  if (!target || target.role !== 'ADMIN') return bad(res, 404, 'Admin account not found.');
-  if (!active && target.id === req.admin.id) return bad(res, 400, 'You cannot deactivate your own admin account.');
-  if (!active && target.is_active) {
-    const activeCount = authDb.prepare("SELECT COUNT(*) AS count FROM admins WHERE role = 'ADMIN' AND is_active = 1 AND is_verified = 1").get().count;
-    if (activeCount <= 1) return bad(res, 400, 'The last active verified admin cannot be deactivated.');
-  }
-  const transaction = authDb.transaction(() => {
-    authDb.prepare('UPDATE admins SET is_active = ?, updated_at = ? WHERE id = ?').run(active ? 1 : 0, new Date().toISOString(), target.id);
+  const reason = String(req.body.reason || '').trim();
+  if (reason.length < 5 || reason.length > 500) return bad(res, 400, 'Enter a reason between 5 and 500 characters.');
+  const now = new Date().toISOString();
+  let target;
+  try {
+    authDb.transaction(() => {
+    const actor = authDb.prepare(`
+      SELECT admins.is_active, admins.is_verified, admins.removed_at, main_admin_config.admin_id
+      FROM admins CROSS JOIN main_admin_config WHERE admins.id = ?
+    `).get(req.admin.id);
+    if (!actor || !actor.is_active || !actor.is_verified || actor.removed_at || actor.admin_id !== req.admin.id) {
+      throw new Error('Main Admin access is no longer active.');
+    }
+    target = authDb.prepare(`
+      SELECT admins.id, admins.name, admins.email, admins.role, admins.is_active, admins.is_verified,
+        admins.approval_status, admins.removed_at, main_admin_config.admin_id
+      FROM admins CROSS JOIN main_admin_config WHERE admins.id = ?
+    `).get(req.params.id);
+    if (!target || target.removed_at) throw new Error('Admin account not found.');
+    if (target.admin_id === target.id) throw new Error('The Main Admin account cannot be changed through regular admin-management actions.');
+    if (!active && target.id === req.admin.id) throw new Error('You cannot deactivate your own Main Admin account.');
+    if (active && !target.is_verified) throw new Error('The admin must complete email verification before activation.');
+    if (active && target.approval_status !== 'approved') throw new Error('The admin must be approved before activation.');
+    authDb.prepare('UPDATE admins SET is_active = ?, updated_at = ?, last_status_change_at = ? WHERE id = ?')
+      .run(active ? 1 : 0, now, now, target.id);
     if (!active) authDb.prepare('DELETE FROM auth_sessions WHERE admin_id = ?').run(target.id);
-  });
-  transaction();
+    authDb.prepare(`
+      INSERT INTO admin_audit_log
+        (id, timestamp, admin_id, acting_admin_role, target_admin_id, action, affected_record, reason, result)
+      VALUES (?, ?, ?, 'MAIN_ADMIN', ?, ?, ?, ?, 'success')
+    `).run(crypto.randomUUID(), now, req.admin.id, target.id, active ? 'admin_activate' : 'admin_deactivate', target.id, reason);
+    })();
+  } catch (error) {
+    return bad(res, error.message.includes('access is no longer') ? 403 : 400, error.message);
+  }
+  let adminReportSync = 'synced';
+  for (const sync of [syncAdminAccountsSheet, syncAdminAuditSheet]) {
+    try {
+      await sync();
+    } catch (error) {
+      adminReportSync = 'failed';
+      console.error('Unable to sync admin account action to Google Sheets:', error.message);
+    }
+  }
   let emailNotification = 'not-configured';
   if (isEmailConfigured()) {
     try {
@@ -1383,19 +2366,131 @@ app.patch('/api/admins/:id/status', requireInstructor, async (req, res) => {
       emailNotification = 'failed';
     }
   }
-  res.json({ ok: true, emailNotification });
+  res.json({ ok: true, emailNotification, adminReportSync });
+});
+app.patch('/api/admins/:id/details', requireInstructor, requireMainAdmin, async (req, res) => {
+  const name = String(req.body.name || '').trim().replace(/\s+/g, ' ');
+  const reason = String(req.body.reason || '').trim();
+  if (!/^[\p{L}\p{M}][\p{L}\p{M} .'-]{1,99}$/u.test(name)) return bad(res, 400, 'Enter a valid full name.');
+  if (reason.length < 5 || reason.length > 500) return bad(res, 400, 'Enter a reason between 5 and 500 characters.');
+  const now = new Date().toISOString();
+  const target = authDb.prepare('SELECT id, name FROM admins WHERE id = ? AND removed_at IS NULL').get(req.params.id);
+  if (!target) return bad(res, 404, 'Admin account not found.');
+  if (authDb.prepare('SELECT admin_id FROM main_admin_config WHERE singleton = 1').get()?.admin_id === target.id) {
+    return bad(res, 400, 'The Main Admin account cannot be edited through regular admin-management actions.');
+  }
+  authDb.transaction(() => {
+    authDb.prepare('UPDATE admins SET name = ?, updated_at = ? WHERE id = ?').run(name, now, target.id);
+    authDb.prepare(`
+      INSERT INTO admin_audit_log
+        (id, timestamp, admin_id, acting_admin_role, target_admin_id, action, affected_record, reason, result)
+      VALUES (?, ?, ?, 'MAIN_ADMIN', ?, 'admin_update', ?, ?, 'success')
+    `).run(crypto.randomUUID(), now, req.admin.id, target.id, target.id, reason);
+  })();
+  let adminReportSync = 'synced';
+  for (const sync of [syncAdminAccountsSheet, syncAdminAuditSheet]) {
+    try {
+      await sync();
+    } catch (error) {
+      adminReportSync = 'failed';
+      console.error('Admin details were updated, but an admin report could not be synchronized:', error.message);
+    }
+  }
+  res.json({ ok: true, adminReportSync });
+});
+app.post('/api/admins/:id/recovery', requireInstructor, requireMainAdmin, async (req, res) => {
+  const target = authDb.prepare(`
+    SELECT admins.id, admins.email, admins.is_verified, admins.removed_at, main_admin_config.admin_id
+    FROM admins CROSS JOIN main_admin_config WHERE admins.id = ?
+  `).get(req.params.id);
+  if (!target || target.removed_at || !target.is_verified) return bad(res, 404, 'Verified admin account not found.');
+  if (target.id === target.admin_id) return bad(res, 400, 'Use the standard password recovery flow for the Main Admin account.');
+  try {
+    await createOtp(target.id, 'reset');
+  } catch (error) {
+    console.error('Unable to initiate admin password recovery:', error.message);
+    return bad(res, 503, emailDeliveryErrorMessage(error));
+  }
+  const now = new Date().toISOString();
+  authDb.prepare(`
+    INSERT INTO admin_audit_log
+      (id, timestamp, admin_id, acting_admin_role, target_admin_id, action, affected_record, reason, result)
+    VALUES (?, ?, ?, 'MAIN_ADMIN', ?, 'admin_recovery_initiated', ?, 'Password recovery code sent to the account email.', 'success')
+  `).run(crypto.randomUUID(), now, req.admin.id, target.id, target.id);
+  let adminReportSync = 'synced';
+  for (const sync of [syncAdminAccountsSheet, syncAdminAuditSheet]) {
+    try {
+      await sync();
+    } catch (error) {
+      adminReportSync = 'failed';
+      console.error('Admin recovery was initiated, but an admin report could not be synchronized:', error.message);
+    }
+  }
+  res.json({ ok: true, adminReportSync });
+});
+app.delete('/api/admins/:id', requireInstructor, requireMainAdmin, async (req, res) => {
+  if (req.body.confirm !== true) return bad(res, 400, 'Confirm admin removal before continuing.');
+  const reason = String(req.body.reason || '').trim();
+  if (reason.length < 5 || reason.length > 500) return bad(res, 400, 'Enter a removal reason between 5 and 500 characters.');
+  const now = new Date().toISOString();
+  try {
+    authDb.transaction(() => {
+      const actor = authDb.prepare(`
+        SELECT admins.is_active, admins.is_verified, admins.removed_at, main_admin_config.admin_id
+        FROM admins CROSS JOIN main_admin_config WHERE admins.id = ?
+      `).get(req.admin.id);
+      if (!actor || !actor.is_active || !actor.is_verified || actor.removed_at || actor.admin_id !== req.admin.id) {
+        throw new Error('Main Admin access is no longer active.');
+      }
+      const target = authDb.prepare(`
+        SELECT admins.id, admins.email, admins.name, main_admin_config.admin_id
+        FROM admins CROSS JOIN main_admin_config
+        WHERE admins.id = ? AND admins.removed_at IS NULL
+      `).get(req.params.id);
+      if (!target) throw new Error('Admin account not found.');
+      if (target.id === actor.admin_id) throw new Error('The Main Admin cannot be removed.');
+      const anonymizedEmail = `removed+${target.id}@removed.invalid`;
+      const identityValues = [target.name, target.email].filter(Boolean).map((value) => value.toLowerCase());
+      const auditReason = identityValues.some((value) => reason.toLowerCase().includes(value))
+        ? 'Account removed by Main Admin; identifying details were redacted.'
+        : reason;
+      authDb.prepare(`
+        UPDATE admins SET removed_at = ?, updated_at = ?, last_status_change_at = ?
+        WHERE id = ?
+      `).run(now, now, now, target.id);
+      anonymizeRemovedAdminData(target);
+      authDb.prepare(`
+        INSERT INTO admin_audit_log
+          (id, timestamp, admin_id, acting_admin_role, target_admin_id, action, affected_record, reason, result)
+        VALUES (?, ?, ?, 'MAIN_ADMIN', ?, 'admin_remove', ?, ?, 'success')
+      `).run(crypto.randomUUID(), now, req.admin.id, target.id, target.id, auditReason);
+    })();
+  } catch (error) {
+    return bad(res, error.message.includes('access is no longer') ? 403 : 400, error.message);
+  }
+  let adminReportSync = 'synced';
+  for (const sync of [syncAdminAccountsSheet, syncAdminAuditSheet]) {
+    try {
+      await sync();
+    } catch (error) {
+      adminReportSync = 'failed';
+      console.error('Admin access was removed, but an admin report could not be synchronized:', error.message);
+    }
+  }
+  res.json({ ok: true, adminReportSync });
 });
 app.get('/api/config', (req, res) => res.json({ subjects, batches }));
-app.get('/api/config', (req, res) => res.json({ subjects, batches }));
+app.get('/api/admin/config', requireInstructor, (req, res) => res.json({ subjects: assignedSubjects(req.admin), batches }));
 
 app.post('/api/sessions', requireInstructor, async (req, res) => {
   const { subject, batch } = req.body;
   if (!subjects.includes(subject)) return bad(res, 400, 'Invalid subject.');
+  if (!requireSubjectAccess(req, res, subject)) return;
   if (batch && !batches.includes(batch)) return bad(res, 400, 'Invalid batch.');
   try {
     const now = Date.now();
     const id = crypto.randomUUID();
-    const session = { id, subject, batch: batch || null, facultyName: req.admin.name, createdAt: now, expiresAt: now + qrMinutes * 60 * 1000, status: 'active' };
+    const session = { id, subject, batch: batch || null, facultyName: req.admin.name, createdBy: req.admin.id, createdAt: now, expiresAt: now + qrMinutes * 60 * 1000, status: 'active' };
     const token = sessionToken(id);
     const baseUrl = resolvePublicUrl(req);
     const url = `${baseUrl}/?session=${encodeURIComponent(token)}`;
@@ -1416,12 +2511,13 @@ app.post('/api/sessions', requireInstructor, async (req, res) => {
 });
 app.get('/api/sessions/:token', (req, res) => {
   const session = readSession(req.params.token);
-  if (!isSessionActive(session)) return bad(res, 410, 'This QR code is invalid or expired. Please scan a valid QR code.');
+  if (!isSessionActive(session) || !sessionIssuerCanAccess(session)) return bad(res, 410, 'This QR code is invalid, expired, or no longer authorized. Please scan a valid QR code.');
   res.json({ subject: session.subject, batch: session.batch, expiresAt: session.expiresAt, valid: true });
 });
 app.post('/api/sessions/:id/close', requireInstructor, async (req, res) => {
   const session = sessions.get(req.params.id);
   if (!session) return bad(res, 404, 'Attendance session not found.');
+  if (!requireSubjectAccess(req, res, session.subject)) return;
   if (session.closedAt) return res.json({ ok: true, added: 0 });
   try {
     const date = serverNow().date;
@@ -1492,7 +2588,7 @@ app.post('/api/sessions/:id/close', requireInstructor, async (req, res) => {
 
 app.post('/api/attendance', async (req, res) => {
   const session = readSession(req.body.token);
-  if (!isSessionActive(session)) return bad(res, 410, 'This QR code is invalid or expired. Please scan a valid QR code.');
+  if (!isSessionActive(session) || !sessionIssuerCanAccess(session)) return bad(res, 410, 'This QR code is invalid, expired, or no longer authorized. Please scan a valid QR code.');
   const name = normalizeName(req.body.name);
   const batch = String(req.body.batch || '');
   const email = normalizeEmail(req.body.email);
@@ -1506,23 +2602,47 @@ app.post('/api/attendance', async (req, res) => {
   if (isHolidayDate(now.date, holidays)) return bad(res, 409, 'Attendance cannot be marked on Sundays or configured holidays.');
   if (await isDeviceSessionAttendanceLocked(now.date, deviceToken, session.id)) return bad(res, 409, deviceLockMessage);
   let lockGranted = false;
-  let studentDeviceLockGranted = false;
+  let deviceBinding = null;
   let attendanceSaved = false;
   try {
     if (await findExisting(session.subject, now.date, name, batch)) return bad(res, 409, 'Your attendance for this subject has already been marked today.');
     const lock = await claimDeviceSessionAttendanceLock({ date: now.date, deviceToken, qrSessionId: session.id, subject: session.subject, studentIdentifier: `${name}|${batch}` });
     if (!lock.allowed) return bad(res, 409, lock.reason);
     lockGranted = true;
-    const studentDeviceLock = await claimStudentDeviceLock(name, batch, deviceToken);
-    if (!studentDeviceLock.allowed) {
+    const candidate = { name, batch };
+    const deviceOwner = checkDeviceOwner(authDb, candidate, hashDeviceToken(deviceToken));
+    if (!deviceOwner.allowed) {
       await releaseDeviceSessionAttendanceLock(now.date, deviceToken, session.id);
       lockGranted = false;
-      return bad(res, 409, studentDeviceLock.reason);
+      return bad(res, 409, deviceOwner.reason);
     }
-    studentDeviceLockGranted = studentDeviceLock.newlyBound;
     const student = await registerStudent(name, batch, email);
+    const binding = bindDevice(authDb, {
+      student,
+      deviceHash: hashDeviceToken(deviceToken),
+      ipAddress: clientIpAddress(req),
+      now: new Date().toISOString()
+    });
+    if (!binding.allowed) {
+      await releaseDeviceSessionAttendanceLock(now.date, deviceToken, session.id);
+      lockGranted = false;
+      return bad(res, 409, binding.reason);
+    }
+    deviceBinding = binding;
     await appendRow(session.subject, [now.date, now.time, name, batch, course, session.subject, 'Present', 'QR', session.id]);
     attendanceSaved = true;
+    let deviceRegistrySync = 'synced';
+    try {
+      if (!recordDeviceAttendance(authDb, binding.record.id, session.subject, now.date)) {
+        throw new Error('Unable to update the registered device record.');
+      }
+      const deviceRecord = listDeviceRegistry(authDb).find((record) => record.id === binding.record.id);
+      if (!deviceRecord) throw new Error('Unable to load the registered device record.');
+      await upsertDeviceRegistrySheetRow(deviceRecord);
+    } catch (error) {
+      deviceRegistrySync = 'failed';
+      console.error('Attendance was saved, but the device registry could not be synchronized:', error.message);
+    }
     await syncPercentage();
     let emailNotification = 'not-requested';
     if (student.email) {
@@ -1545,12 +2665,14 @@ app.post('/api/attendance', async (req, res) => {
         }
       }
     }
-    res.json({ date: now.date, time: now.time, name, batch, course, subject: session.subject, status: 'Present', emailNotification });
+    res.json({ date: now.date, time: now.time, name, batch, course, subject: session.subject, status: 'Present', emailNotification, deviceRegistrySync });
   } catch (error) {
     if (lockGranted) await releaseDeviceSessionAttendanceLock(now.date, deviceToken, session.id);
-    if (studentDeviceLockGranted && !attendanceSaved) await releaseStudentDeviceLock(name, batch, deviceToken);
+    if (deviceBinding?.newlyBound && !attendanceSaved) releaseNewDeviceBinding(authDb, deviceBinding.record.id);
     console.error(error);
-    bad(res, 500, "We couldn't save your attendance right now. Please try again.");
+    bad(res, 500, attendanceSaved
+      ? 'Attendance was recorded, but a follow-up update failed. Please contact your instructor before retrying.'
+      : "We couldn't save your attendance right now. Please try again.");
   }
 });
 
@@ -1622,7 +2744,7 @@ app.post('/api/attendance/email-summary', requireInstructor, async (req, res) =>
 
     const today = serverNow().date;
     const subjectSummary = [];
-    for (const subject of subjects) {
+    for (const subject of assignedSubjects(req.admin)) {
       const rows = await readRows(subject);
       const records = rows.slice(1).filter((row) =>
         normalizeName(row[2]).toLowerCase() === student.name.toLowerCase()
@@ -1668,7 +2790,7 @@ app.post('/api/attendance/email-summary', requireInstructor, async (req, res) =>
 app.get('/api/report', requireInstructor, async (req, res) => {
   try {
     const rows = [];
-    for (const subject of subjects) {
+    for (const subject of assignedSubjects(req.admin)) {
       const values = await readRows(subject);
       values.slice(1).filter((row) => row[6] !== 'Not Marked').forEach((r) => rows.push({ date: r[0], time: r[1], name: r[2], batch: r[3], course: r[4], subject, status: r[6], source: r[7] }));
     }
@@ -1677,9 +2799,10 @@ app.get('/api/report', requireInstructor, async (req, res) => {
 });
 app.get('/api/percentages', requireInstructor, async (req, res) => {
   try {
+    const availableSubjects = assignedSubjects(req.admin);
     const students = await getStudents();
     const rows = [];
-    for (const subject of subjects) {
+    for (const subject of availableSubjects) {
       const values = await readRows(subject);
       values.slice(1).forEach((r) => rows.push({ date: r[0], name: normalizeName(r[2]), batch: r[3], course: r[4], subject, status: r[6] }));
     }
@@ -1692,7 +2815,7 @@ app.get('/api/percentages', requireInstructor, async (req, res) => {
     const result = [];
     const overall = new Map();
     for (const student of reportStudents) {
-      for (const subject of subjects) {
+      for (const subject of availableSubjects) {
         const subjectRows = rows.filter((row) =>
           row.name.toLowerCase() === student.name.toLowerCase()
           && row.batch === student.batch
@@ -1720,6 +2843,7 @@ app.post('/api/correct', requireInstructor, async (req, res) => {
   const date = String(requestedDate || today).trim();
   const validDate = /^\d{4}-\d{2}-\d{2}$/.test(date) && !Number.isNaN(Date.parse(`${date}T00:00:00Z`)) && date <= today;
   if (!subjects.includes(subject) || !batches.includes(batch) || !['Present', 'Absent'].includes(status) || !validDate) return bad(res, 400, 'Choose a valid date up to today.');
+  if (!requireSubjectAccess(req, res, subject)) return;
   if (isHolidayDate(date, holidays)) return bad(res, 400, 'Attendance cannot be corrected on Sundays or configured holidays.');
   try {
     const row = [date, status === 'Absent' ? '-' : serverNow().time, normalizeName(name), batch, courseFor(batch), subject, status, 'Instructor correction', 'manual'];
@@ -1766,6 +2890,10 @@ if (isDirectExecution) {
           .then(() => ensureAttendanceCalendar())
           .then(() => syncAttendanceValidation())
           .then(() => syncPercentage())
+          .then(() => ensureSecuritySheets())
+          .then(() => syncDeviceRegistrySheet())
+          .then(() => syncAdminAccountsSheet())
+          .then(() => syncAdminAuditSheet())
           .catch((error) => console.error('Unable to sync subject matrices:', error.message));
       });
     })

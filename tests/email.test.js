@@ -36,12 +36,15 @@ test('admin email templates include dynamic, safely rendered verification detail
     name: 'Priya Sharma',
     email: 'priya@example.test',
     role: 'ADMIN',
-    otp: '456789'
+    otp: '456789',
+    temporaryPassword: 'temporary-random-password'
   });
   assert.match(invitation.subject, /Invitation/);
   assert.match(invitation.html, /Priya Sharma/);
   assert.match(invitation.html, /priya@example\.test/);
   assert.match(invitation.html, /456789/);
+  assert.match(invitation.html, /temporary-random-password/);
+  assert.match(invitation.text, /change it immediately after signing in/i);
 
   const reset = buildPasswordResetEmail({ name: 'Asha', otp: '654321', expiryMinutes: 10 });
   assert.match(reset.subject, /Password Reset OTP/);
@@ -54,6 +57,11 @@ test('account status and welcome templates use the supplied account details', ()
   assert.match(welcome.html, /Sam/);
   assert.match(welcome.html, /sam@example\.test/);
   assert.match(welcome.html, /successfully verified/);
+  const pendingWelcome = buildWelcomeEmail({
+    name: 'Sam', email: 'sam@example.test', role: 'ADMIN', approvalPending: true
+  });
+  assert.match(pendingWelcome.text, /waiting for Main Admin approval/i);
+  assert.match(pendingWelcome.text, /cannot sign in until it is approved/i);
 
   const activated = buildAccountStatusEmail({
     name: 'Sam', email: 'sam@example.test', role: 'ADMIN', active: true

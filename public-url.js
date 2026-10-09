@@ -31,6 +31,13 @@ function replaceLoopbackHost(url, networkInterfaces) {
   return url;
 }
 
+function validateWebUrl(url) {
+  if (!['http:', 'https:'].includes(url.protocol) || !url.hostname) {
+    throw new Error('APP_URL must use HTTP or HTTPS and include a host.');
+  }
+  return url;
+}
+
 export function resolvePublicUrl(req, {
   configuredUrl = '',
   httpsEnabled = false,
@@ -45,6 +52,7 @@ export function resolvePublicUrl(req, {
     } catch (error) {
       throw new Error('APP_URL must be a valid absolute URL.', { cause: error });
     }
+    validateWebUrl(configuredUrlObject);
     return replaceLoopbackHost(configuredUrlObject, networkInterfaces).toString().replace(/\/$/, '');
   }
 
@@ -56,7 +64,13 @@ export function resolvePublicUrl(req, {
     : req?.headers['x-forwarded-host'];
   const proto = forwardedProto || (httpsEnabled ? 'https' : 'http');
   const host = forwardedHost || req?.headers.host || `localhost:${port}`;
-  const url = new URL(`${proto}://${host}`);
+  let url;
+  try {
+    url = new URL(`${proto}://${host}`);
+  } catch (error) {
+    throw new Error('The request host is invalid; set APP_URL to a phone-accessible HTTP or HTTPS URL.', { cause: error });
+  }
+  validateWebUrl(url);
   replaceLoopbackHost(url, networkInterfaces);
   return url.toString().replace(/\/$/, '');
 }

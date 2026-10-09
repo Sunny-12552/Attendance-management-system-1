@@ -15,12 +15,16 @@ services:
         value: production
       - key: JWT_SECRET
         generateValue: true
+      - key: MAIN_ADMIN_BOOTSTRAP_SECRET
+        sync: false
       - key: DATABASE_URL
         value: /var/data/attendance.sqlite
       - key: DEVICE_LOCKS_PATH
         value: /var/data/.device-locks.json
       - key: QR_MINUTES
         value: "30"
+      - key: TRUST_PROXY_HOPS
+        value: "1"
       - key: TIMEZONE
         value: Asia/Kolkata
       - key: GOOGLE_SPREADSHEET_ID

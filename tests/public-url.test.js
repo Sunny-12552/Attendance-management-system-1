@@ -59,3 +59,19 @@ test('rejects an invalid configured APP_URL instead of generating a broken QR', 
     /APP_URL must be a valid absolute URL/
   );
 });
+
+test('rejects non-web APP_URL schemes instead of generating an unscannable QR', () => {
+  assert.throws(
+    () => resolvePublicUrl(undefined, { configuredUrl: 'javascript:alert(1)' }),
+    /APP_URL must use HTTP or HTTPS/
+  );
+});
+
+test('rejects non-web forwarded protocols instead of generating an unscannable QR', () => {
+  assert.throws(
+    () => resolvePublicUrl({
+      headers: { 'x-forwarded-host': 'rollcall.example.com', 'x-forwarded-proto': 'javascript' }
+    }),
+    /APP_URL must use HTTP or HTTPS/
+  );
+});

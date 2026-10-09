@@ -111,7 +111,7 @@ function message({ subject, title, name, intro, details, highlight, notice, clos
   };
 }
 
-function otpMessage({ name, email, role = 'ADMIN', otp, expiryMinutes = OTP_EXPIRY_MINUTES, invitation = false, reset = false }) {
+function otpMessage({ name, email, role = 'ADMIN', otp, expiryMinutes = OTP_EXPIRY_MINUTES, invitation = false, reset = false, temporaryPassword }) {
   const title = reset
     ? 'Password reset verification'
     : invitation
@@ -125,9 +125,13 @@ function otpMessage({ name, email, role = 'ADMIN', otp, expiryMinutes = OTP_EXPI
   const intro = reset
     ? 'We received a request to reset your administrator password.'
     : invitation
-      ? 'You have been invited to join the Attendance Management System. Complete signup and verify your email using this code.'
+      ? temporaryPassword
+        ? 'The Main Admin created an administrator account for you. Sign in with the email and short temporary password below, then enter the one-time code. You will be required to choose a new password before using the dashboard.'
+        : 'You have been invited to join the Attendance Management System. Complete signup and verify your email using this code.'
       : 'Welcome to the Attendance Management System! Your account has been created successfully.';
-  const details = reset ? [] : [['Email', email], ['Role', role]];
+  const details = reset
+    ? []
+    : [['Email', email], ['Role', role], ...(temporaryPassword ? [['Temporary password', temporaryPassword]] : [])];
   return message({
     subject,
     title,
@@ -137,7 +141,9 @@ function otpMessage({ name, email, role = 'ADMIN', otp, expiryMinutes = OTP_EXPI
     highlight: { label: `Your verification code · valid for ${expiryMinutes} minutes`, value: otp },
     notice: reset
       ? 'If you did not request a password reset, you can ignore this message. Never share this code with anyone.'
-      : 'Please do not share this verification code with anyone.'
+      : invitation && temporaryPassword
+        ? 'The temporary password is for first sign-in only. Change it immediately after signing in. Do not share these credentials or the one-time code.'
+        : 'Please do not share this verification code with anyone.'
   });
 }
 
@@ -153,14 +159,18 @@ export function buildPasswordResetEmail(details) {
   return otpMessage({ ...details, reset: true });
 }
 
-export function buildWelcomeEmail({ name, email, role = 'ADMIN' }) {
+export function buildWelcomeEmail({ name, email, role = 'ADMIN', approvalPending = false }) {
   return message({
-    subject: 'Welcome to the Attendance Management System',
-    title: 'Your account is verified',
+    subject: approvalPending ? 'Admin Registration Received' : 'Welcome to the Attendance Management System',
+    title: approvalPending ? 'Your email is verified' : 'Your account is verified',
     name,
-    intro: 'Your account has been successfully verified. You can now log in to the Attendance Management System.',
+    intro: approvalPending
+      ? 'Your email has been verified. Your administrator registration is waiting for Main Admin approval; you cannot sign in until it is approved.'
+      : 'Your account has been successfully verified. You can now log in to the Attendance Management System.',
     details: [['Account email', email], ['Role', role]],
-    closing: 'You can now sign in using your registered email and password.'
+    closing: approvalPending
+      ? 'You will be able to sign in after your administrator account is approved.'
+      : 'You can now sign in using your registered email and password.'
   });
 }
 
