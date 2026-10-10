@@ -4,38 +4,69 @@ const OTP_EXPIRY_MINUTES = 10;
 const EMAIL_SENDER_NAME = 'Attendance Management System';
 let cachedTransport;
 
-function emailConfig() {
+function emailProvider() {
+  return String(process.env.EMAIL_PROVIDER || 'smtp').trim().toLowerCase();
+}
+
+function smtpEmailConfig() {
   const host = String(process.env.SMTP_HOST || '').trim();
   const user = String(process.env.SMTP_USER || '').trim();
   const password = String(process.env.SMTP_PASSWORD || '');
-  const from = String(process.env.SMTP_FROM || '').trim();
+  const from = String(process.env.EMAIL_FROM || process.env.SMTP_FROM || '').trim();
   const port = Number(process.env.SMTP_PORT || 587);
-  if (!host || !user || !password || !from || !Number.isInteger(port) || port < 1 || port > 65535) {
+  if (!host || !user || !password || !isValidEmailAddress(from) || !Number.isInteger(port) || port < 1 || port > 65535) {
     return null;
   }
   return { host, user, password, from, port, secure: process.env.SMTP_SECURE === 'true' };
 }
 
+function resendEmailConfig() {
+  const apiKey = String(process.env.RESEND_API_KEY || '').trim();
+  const from = String(process.env.EMAIL_FROM || '').trim();
+  if (!apiKey || !isValidEmailAddress(from)) return null;
+  return { apiKey, from };
+}
+
+function isValidEmailAddress(value) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+}
+
 export function isEmailConfigured() {
-  return emailConfig() !== null;
+  const provider = emailProvider();
+  if (provider === 'resend') return resendEmailConfig() !== null;
+  if (provider === 'smtp') return smtpEmailConfig() !== null;
+  return false;
 }
 
 export function emailConfigurationMessage() {
-  return 'Email service is not configured. Please configure SMTP settings.';
+  const provider = emailProvider();
+  if (provider === 'resend') {
+    return 'Email service is not configured. Set RESEND_API_KEY and a valid EMAIL_FROM address for Resend.';
+  }
+  if (provider === 'smtp') {
+    return 'Email service is not configured. Set EMAIL_FROM (or SMTP_FROM) and valid SMTP settings.';
+  }
+  return 'Email service is not configured. Set EMAIL_PROVIDER to "resend" or "smtp".';
 }
 
 export function emailDeliveryErrorMessage(error) {
   if (error?.code === 'EMAIL_NOT_CONFIGURED') return emailConfigurationMessage();
   if (error?.code === 'EMAIL_AUTH_FAILED') {
+    if (emailProvider() === 'resend') {
+      return 'Resend rejected the API key. Check RESEND_API_KEY in the deployment environment.';
+    }
     return /gmail/i.test(String(process.env.SMTP_HOST || ''))
       ? 'Gmail rejected the sender login. Enable 2-Step Verification and use a Google App Password as SMTP_PASSWORD, then restart the app.'
       : 'The email server rejected the sender login. Check SMTP_USER and SMTP_PASSWORD in .env, then restart the app.';
+  }
+  if (emailProvider() === 'resend') {
+    return 'Unable to deliver email through Resend. Check the sender domain and Resend configuration, then try again.';
   }
   return 'Unable to deliver the email. Please check the SMTP settings and try again.';
 }
 
 function getTransport() {
-  const config = emailConfig();
+  const config = smtpEmailConfig();
   if (!config) {
     const error = new Error(emailConfigurationMessage());
     error.code = 'EMAIL_NOT_CONFIGURED';
@@ -53,6 +84,40 @@ function getTransport() {
     transport: cachedTransport,
     from: { name: EMAIL_SENDER_NAME, address: config.from }
   };
+}
+
+async function sendWithResend(config, to, emailMessage) {
+  let response;
+  try {
+    response = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${config.apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        from: `${EMAIL_SENDER_NAME} <${config.from}>`,
+        to,
+        subject: emailMessage.subject,
+        text: emailMessage.text,
+        html: emailMessage.html
+      }),
+      signal: AbortSignal.timeout(15000)
+    });
+  } catch {
+    const error = new Error('The Resend API request failed.');
+    error.code = 'EMAIL_DELIVERY_FAILED';
+    throw error;
+  }
+
+  if (!response.ok) {
+    const error = new Error('The Resend API rejected the email request.');
+    error.code = response.status === 401 || response.status === 403
+      ? 'EMAIL_AUTH_FAILED'
+      : 'EMAIL_DELIVERY_FAILED';
+    error.status = response.status;
+    throw error;
+  }
 }
 
 function escapeHtml(value) {
@@ -240,6 +305,23 @@ export function buildAccountStatusEmail({ name, email, role = 'ADMIN', active })
 }
 
 export async function sendEmail(to, emailMessage) {
+  const provider = emailProvider();
+  if (!isEmailConfigured()) {
+    const error = new Error(emailConfigurationMessage());
+    error.code = 'EMAIL_NOT_CONFIGURED';
+    throw error;
+  }
+
+  if (provider === 'resend') {
+    try {
+      await sendWithResend(resendEmailConfig(), to, emailMessage);
+      return;
+    } catch (error) {
+      console.error('Email delivery failed with Resend:', error.status ? `HTTP ${error.status}` : error.code);
+      throw error;
+    }
+  }
+
   try {
     const { transport, from } = getTransport();
     await transport.sendMail({
@@ -251,7 +333,7 @@ export async function sendEmail(to, emailMessage) {
     });
   } catch (error) {
     if (error.code === 'EMAIL_NOT_CONFIGURED') throw error;
-    console.error('Email delivery failed:', error.message);
+    console.error('Email delivery failed with SMTP:', error.code || 'unknown error');
     const authFailure = error.code === 'EAUTH'
       || error.responseCode === 534
       || error.responseCode === 535
