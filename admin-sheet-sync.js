@@ -62,10 +62,32 @@ function mismatchColumns(actual, expectedSchemas) {
       ).reduce((total, mismatch) => total + mismatch, 0)
     }))
     .sort((left, right) => left.differenceCount - right.differenceCount)[0];
-  if (!closest) return [];
-  return Array.from({ length: Math.max(actual.length, closest.headers.length) }, (_, index) => index)
-    .filter((index) => actual[index] !== closest.headers[index])
-    .map(columnName);
+  if (!closest) return { columns: [], firstMismatch: null };
+  const mismatchedIndexes = Array.from({ length: Math.max(actual.length, closest.headers.length) }, (_, index) => index)
+    .filter((index) => actual[index] !== closest.headers[index]);
+  const firstMismatchIndex = mismatchedIndexes[0];
+  return {
+    columns: mismatchedIndexes.map(columnName),
+    firstMismatch: firstMismatchIndex === undefined
+      ? null
+      : {
+        column: columnName(firstMismatchIndex),
+        expected: closest.headers[firstMismatchIndex],
+        actual: actual[firstMismatchIndex],
+        schema: closest.headers
+      }
+  };
+}
+
+function safeHeaderDiagnostic(value) {
+  if (value === undefined) return '<missing>';
+  const header = String(value).trim();
+  if (!header) return '<blank>';
+  if (
+    header.length > 80
+    || /@|\b\d{7,}\b|(?:bearer|token|secret|password|key)\s*[:=]/i.test(header)
+  ) return '<redacted>';
+  return JSON.stringify(header);
 }
 
 export async function readSecuritySheetSchema(service, spreadsheetId, title) {
@@ -98,10 +120,16 @@ export async function readSecuritySheetSchema(service, spreadsheetId, title) {
   const supportedHeaders = [currentHeaders, ...(legacyHeaders ? [legacyHeaders] : [])];
   const matchedHeaders = supportedHeaders.find((candidate) => sameHeaders(headerRow, candidate));
   if (!matchedHeaders) {
-    const mismatches = mismatchColumns(headerRow, supportedHeaders);
+    const { columns, firstMismatch } = mismatchColumns(headerRow, supportedHeaders);
+    const schemaLabel = firstMismatch
+      ? (firstMismatch.schema === currentHeaders ? 'current' : 'legacy')
+      : 'supported';
+    const mismatchDiagnostic = firstMismatch
+      ? `; first mismatch at ${firstMismatch.column}: expected ${safeHeaderDiagnostic(firstMismatch.expected)} (${schemaLabel} schema), found ${safeHeaderDiagnostic(firstMismatch.actual)}`
+      : '';
     return {
       supported: false,
-      reason: `header row has ${headerRow.length} populated columns; it differs from supported schemas at ${mismatches.join(', ') || 'unknown columns'}`
+      reason: `header row has ${headerRow.length} populated columns; it differs from supported schemas at ${columns.join(', ') || 'unknown columns'}${mismatchDiagnostic}`
     };
   }
   return {

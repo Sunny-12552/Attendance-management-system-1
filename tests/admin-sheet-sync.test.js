@@ -147,6 +147,47 @@ test('unknown Admin Accounts headers are diagnosed without modifying or syncing 
   assert.deepEqual(calls.map((call) => call.method), ['get']);
 });
 
+test('10-column Admin Accounts mismatch at H identifies current and actual header safely', async () => {
+  const actualHeaders = [...legacySecuritySheetHeaders['Admin Accounts']];
+  actualHeaders[7] = 'Failed Attempts';
+  const sensitiveRow = [
+    'admin-id-that-must-not-be-logged',
+    'private.person@example.test',
+    'ADMIN',
+    'Active',
+    'private-record-data',
+    'private-record-data',
+    'private-record-data',
+    'private-record-data',
+    'private-record-data',
+    'private-record-data'
+  ];
+  const { service, calls } = createSheetsService({ 'Admin Accounts': [actualHeaders, sensitiveRow] });
+
+  assert.equal(securitySheetHeaders['Admin Accounts'][7], 'Last Password Change At');
+  assert.equal(legacySecuritySheetHeaders['Admin Accounts'][7], 'Failed Login Attempts');
+
+  const schema = await readSecuritySheetSchema(service, 'test-sheet', 'Admin Accounts');
+  assert.equal(schema.supported, false);
+  assert.match(
+    schema.reason,
+    /first mismatch at H: expected "Failed Login Attempts" \(legacy schema\), found "Failed Attempts"/
+  );
+  assert.doesNotMatch(schema.reason, /admin-id-that-must-not-be-logged|private\.person@example\.test|private-record-data/);
+
+  const result = await syncSheetRowsById({
+    service,
+    spreadsheetId: 'test-sheet',
+    title: 'Admin Accounts',
+    schema,
+    idHeader: 'Admin ID',
+    records: [{ id: 'admin-new', email: 'new@example.test' }],
+    fieldsForRecord: (admin) => adminFields(admin.id, admin.email)
+  });
+  assert.equal(result.skipped, true);
+  assert.deepEqual(calls.map((call) => call.method), ['get']);
+});
+
 test('a blank header row with existing data is not initialized or overwritten', async () => {
   const { service, calls } = createSheetsService({
     'Admin Accounts': [[], ['unrecognized', 'existing data']]
