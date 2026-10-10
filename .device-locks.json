@@ -1,8 +1,27 @@
 {
-  "2026-09-12|a5d59077942c4610de923c5dcbedc59f15a7b7c1779dff843982e0f70b1412bd": {
-    "date": "2026-09-12",
-    "deviceTokenHash": "a5d59077942c4610de923c5dcbedc59f15a7b7c1779dff843982e0f70b1412bd",
-    "studentIdentifier": "Ajay|D7",
-    "createdAt": 1789179222332
+  "deviceAttendanceLocks": {
+    "2026-09-12|a5d59077942c4610de923c5dcbedc59f15a7b7c1779dff843982e0f70b1412bd": {
+      "date": "2026-09-12",
+      "deviceTokenHash": "a5d59077942c4610de923c5dcbedc59f15a7b7c1779dff843982e0f70b1412bd",
+      "studentIdentifier": "Ajay|D7",
+      "createdAt": 1789179222332,
+      "qrSessionId": "a5d59077942c4610de923c5dcbedc59f15a7b7c1779dff843982e0f70b1412bd"
+    },
+    "2026-10-09|1a57f59a-8800-4584-8260-b56d366e0361|d7bbba5629cccc59355525e8477093528824cc53ec4477584f99bb2842dd35ab": {
+      "date": "2026-10-09",
+      "qrSessionId": "1a57f59a-8800-4584-8260-b56d366e0361",
+      "subject": "React",
+      "deviceTokenHash": "d7bbba5629cccc59355525e8477093528824cc53ec4477584f99bb2842dd35ab",
+      "studentIdentifier": "Shashank|P4",
+      "createdAt": 1791567296221
+    },
+    "2026-10-10|7ab4d31b-65dd-4227-a83c-5a844c737bfd|d7bbba5629cccc59355525e8477093528824cc53ec4477584f99bb2842dd35ab": {
+      "date": "2026-10-10",
+      "qrSessionId": "7ab4d31b-65dd-4227-a83c-5a844c737bfd",
+      "subject": "HTML",
+      "deviceTokenHash": "d7bbba5629cccc59355525e8477093528824cc53ec4477584f99bb2842dd35ab",
+      "studentIdentifier": "Shashank|P4",
+      "createdAt": 1791579575938
+    }
   }
 }
