@@ -27,6 +27,12 @@ import {
 import { resolvePublicUrl as buildPublicUrl } from './public-url.js';
 import { loadGoogleServiceAccountCredentials } from './google-service-account.js';
 import {
+  columnName,
+  readSecuritySheetSchema,
+  securitySheetHeaders,
+  syncSheetRowsById
+} from './admin-sheet-sync.js';
+import {
   emailDeliveryErrorMessage,
   emailConfigurationMessage,
   isEmailConfigured,
@@ -721,32 +727,6 @@ async function ensureSheetLayout() {
   })();
   return layoutPromise;
 }
-const securitySheetHeaders = {
-  'Device Registry': [
-    'Student ID', 'Student Name', 'Batch', 'Course', 'Device ID Hash',
-    'Registered IP Address', 'First Registered At', 'Last Seen At', 'Device Status',
-    'Last Attendance Subject', 'Last Attendance Date', 'Admin Unlock Timestamp', 'Unlock Reason'
-  ],
-  'Admin Accounts': [
-    'Admin ID', 'Admin Email', 'Admin Role', 'Account Status', 'Created At',
-    'Last Login At', 'Last Status Change At', 'Last Password Change At', 'Failed Login Attempts',
-    'Last Successful Login', 'Account Lock Status'
-  ],
-  'Admin Audit Log': [
-    'Audit ID', 'Timestamp', 'Admin ID', 'Admin Email', 'Action', 'Affected Record', 'Reason',
-    'Acting Admin Role', 'Target Admin ID', 'Result'
-  ]
-};
-const legacySecuritySheetHeaders = {
-  'Admin Accounts': [
-    'Admin ID', 'Admin Email', 'Admin Role', 'Account Status', 'Created At',
-    'Last Login At', 'Last Password Change At', 'Failed Login Attempts',
-    'Last Successful Login', 'Account Lock Status'
-  ],
-  'Admin Audit Log': [
-    'Audit ID', 'Timestamp', 'Admin ID', 'Admin Email', 'Action', 'Affected Record', 'Reason'
-  ]
-};
 async function ensureSecuritySheets() {
   await ensureSheetLayout();
   const service = getSheets();
@@ -761,74 +741,54 @@ async function ensureSecuritySheets() {
     metadata = await readSheetsMetadata('sheets.properties.title,sheets.properties.sheetId');
     sheetsByTitle = new Map(metadata.data.sheets.map((sheet) => [sheet.properties.title, sheet.properties.sheetId]));
   }
-  for (const [title, headers] of Object.entries(securitySheetHeaders)) {
-    const result = await service.spreadsheets.values.get({
-      spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
-      range: `'${title}'!A1:${columnName(headers.length - 1)}1`
-    });
-    const existingHeaders = result.data.values?.[0] || [];
-    if (!existingHeaders.length) {
-      await service.spreadsheets.values.update({
-        spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
-        range: `'${title}'!A1`,
-        valueInputOption: 'RAW',
-        requestBody: { values: [headers] }
-      });
-    } else if (headers.some((header, index) => existingHeaders[index] !== header)) {
-      const legacyHeaders = legacySecuritySheetHeaders[title];
-      const isKnownLegacy = legacyHeaders
-        && legacyHeaders.every((header, index) => existingHeaders[index] === header)
-        && existingHeaders.slice(legacyHeaders.length).every((header) => !header);
-      if (!isKnownLegacy) throw new Error(`The existing "${title}" sheet has unexpected headers; it was not modified.`);
-      await service.spreadsheets.values.update({
-        spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
-        range: `'${title}'!A1`,
-        valueInputOption: 'RAW',
-        requestBody: { values: [headers] }
-      });
+  const schemas = new Map();
+  for (const title of Object.keys(securitySheetHeaders)) {
+    const schema = await readSecuritySheetSchema(service, process.env.GOOGLE_SPREADSHEET_ID, title);
+    schemas.set(title, schema.supported ? schema : null);
+    if (!schema.supported) {
+      console.warn(`Skipping Google Sheets sync for "${title}": ${schema.reason}; no cells were modified.`);
     }
   }
-  return sheetsByTitle;
+  return { schemas };
 }
-async function writeDeviceRegistrySheetRow(record) {
-  await ensureSecuritySheets();
-  const range = "'Device Registry'!A2:M10000";
-  const response = await getSheets().spreadsheets.values.get({
+function deviceRegistrySheetFields(item) {
+  return {
+    'Student ID': item.studentId || '',
+    'Student Name': item.studentName,
+    Batch: item.batch,
+    Course: item.course,
+    'Device ID Hash': item.deviceHash,
+    'Registered IP Address': item.registeredIp,
+    'First Registered At': item.firstRegisteredAt,
+    'Last Seen At': item.lastSeenAt,
+    'Device Status': item.status,
+    'Last Attendance Subject': item.lastAttendanceSubject,
+    'Last Attendance Date': item.lastAttendanceDate,
+    'Admin Unlock Timestamp': item.adminUnlockTimestamp || '',
+    'Unlock Reason': item.unlockReason || ''
+  };
+}
+async function writeDeviceRegistrySheetRow(record, knownSchema) {
+  const schema = knownSchema || (await ensureSecuritySheets()).schemas.get('Device Registry');
+  await syncSheetRowsById({
+    service: getSheets(),
     spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
-    range
+    title: 'Device Registry',
+    schema,
+    idHeader: 'Device ID Hash',
+    records: [record],
+    fieldsForRecord: deviceRegistrySheetFields,
+    onDuplicate: (count) => console.warn(`Skipping duplicate Device ID Hash entries in "Device Registry" (${count} duplicates).`),
+    onSkipped: (reason) => console.warn(`Skipping Google Sheets sync for "Device Registry": ${reason}; no cells were modified.`)
   });
-  const values = response.data.values || [];
-  const index = values.findIndex((row) => row[4] === record.deviceHash);
-  const row = [
-    record.studentId || '', record.studentName, record.batch, record.course, record.deviceHash,
-    record.registeredIp, record.firstRegisteredAt, record.lastSeenAt, record.status,
-    record.lastAttendanceSubject, record.lastAttendanceDate,
-    record.adminUnlockTimestamp || '', record.unlockReason || ''
-  ];
-  if (index >= 0) {
-    await getSheets().spreadsheets.values.update({
-      spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
-      range: `'Device Registry'!A${index + 2}:M${index + 2}`,
-      valueInputOption: 'RAW',
-      requestBody: { values: [row] }
-    });
-  } else {
-    await getSheets().spreadsheets.values.append({
-      spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
-      range: "'Device Registry'!A:M",
-      valueInputOption: 'RAW',
-      insertDataOption: 'INSERT_ROWS',
-      requestBody: { values: [row] }
-    });
-  }
 }
-async function upsertDeviceRegistrySheetRow(record) {
+async function upsertDeviceRegistrySheetRow(record, knownSchema) {
   const pending = deviceRegistrySheetSyncs.get(record.deviceHash);
   if (pending) {
     await pending;
-    return upsertDeviceRegistrySheetRow(record);
+    return upsertDeviceRegistrySheetRow(record, knownSchema);
   }
-  const sync = writeDeviceRegistrySheetRow(record);
+  const sync = writeDeviceRegistrySheetRow(record, knownSchema);
   deviceRegistrySheetSyncs.set(record.deviceHash, sync);
   try {
     return await sync;
@@ -839,7 +799,7 @@ async function upsertDeviceRegistrySheetRow(record) {
   }
 }
 async function syncDeviceRegistrySheet() {
-  await ensureSecuritySheets();
+  const { schemas } = await ensureSecuritySheets();
   const latestRecords = new Map();
   for (const record of listDeviceRegistry(authDb)) {
     const existing = latestRecords.get(record.deviceHash);
@@ -850,12 +810,22 @@ async function syncDeviceRegistrySheet() {
       latestRecords.set(record.deviceHash, record);
     }
   }
-  for (const record of latestRecords.values()) {
-    await upsertDeviceRegistrySheetRow(record);
-  }
+  await syncSheetRowsById({
+    service: getSheets(),
+    spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
+    title: 'Device Registry',
+    schema: schemas.get('Device Registry'),
+    idHeader: 'Device ID Hash',
+    records: [...latestRecords.values()],
+    fieldsForRecord: deviceRegistrySheetFields,
+    onDuplicate: (count) => console.warn(`Skipping duplicate Device ID Hash entries in "Device Registry" (${count} duplicates).`),
+    onSkipped: (reason) => console.warn(`Skipping Google Sheets sync for "Device Registry": ${reason}; no cells were modified.`)
+  });
 }
 async function syncAdminAccountsSheet() {
-  await ensureSecuritySheets();
+  const { schemas } = await ensureSecuritySheets();
+  const schema = schemas.get('Admin Accounts');
+  if (!schema) return;
   const rows = authDb.prepare(`
     SELECT admins.id, admins.email, admins.role, admins.is_verified, admins.is_active, admins.approval_status,
       admins.removed_at,
@@ -865,79 +835,62 @@ async function syncAdminAccountsSheet() {
       CASE WHEN main_admin_config.admin_id = admins.id THEN 'MAIN_ADMIN' ELSE 'ADMIN' END AS effective_role
     FROM admins LEFT JOIN main_admin_config ON main_admin_config.singleton = 1
     ORDER BY created_at
-  `).all().map((admin) => [
-    admin.id, admin.removed_at ? 'Removed' : admin.email, admin.effective_role,
-    admin.removed_at ? 'Removed'
-      : !admin.is_verified ? 'Pending verification'
-      : admin.approval_status === 'pending' ? 'Pending approval'
-        : admin.approval_status === 'rejected' ? 'Rejected'
-          : admin.is_active ? 'Active' : 'Inactive',
-    admin.created_at, admin.last_login || '', admin.last_status_change_at || '', admin.last_password_change_at || '',
-    admin.failed_login_attempts, admin.last_successful_login || '',
-    admin.account_lock_until > Date.now() ? 'Locked' : 'Not locked'
-  ]);
-  const response = await getSheets().spreadsheets.values.get({
+  `).all();
+  await syncSheetRowsById({
+    service: getSheets(),
     spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
-    range: "'Admin Accounts'!A2:K10000"
+    title: 'Admin Accounts',
+    schema,
+    idHeader: 'Admin ID',
+    records: rows,
+    fieldsForRecord: (admin) => ({
+      'Admin ID': admin.id,
+      'Admin Email': admin.removed_at ? 'Removed' : admin.email,
+      'Admin Role': admin.effective_role,
+      'Account Status': admin.removed_at ? 'Removed'
+        : !admin.is_verified ? 'Pending verification'
+          : admin.approval_status === 'pending' ? 'Pending approval'
+            : admin.approval_status === 'rejected' ? 'Rejected'
+              : admin.is_active ? 'Active' : 'Inactive',
+      'Created At': admin.created_at,
+      'Last Login At': admin.last_login || '',
+      'Last Status Change At': admin.last_status_change_at || '',
+      'Last Password Change At': admin.last_password_change_at || '',
+      'Failed Login Attempts': admin.failed_login_attempts,
+      'Last Successful Login': admin.last_successful_login || '',
+      'Account Lock Status': admin.account_lock_until > Date.now() ? 'Locked' : 'Not locked'
+    }),
+    onDuplicate: (count) => console.warn(`Skipping duplicate Admin ID entries in "Admin Accounts" (${count} duplicates).`),
+    onSkipped: (reason) => console.warn(`Skipping Google Sheets sync for "Admin Accounts": ${reason}; no cells were modified.`)
   });
-  const existingRows = response.data.values || [];
-  for (const row of rows) {
-    const index = existingRows.findIndex((existing) => existing[0] === row[0]);
-    if (index >= 0) {
-      await getSheets().spreadsheets.values.update({
-        spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
-        range: `'Admin Accounts'!A${index + 2}:K${index + 2}`,
-        valueInputOption: 'RAW',
-        requestBody: { values: [row] }
-      });
-    } else {
-      await getSheets().spreadsheets.values.append({
-        spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
-        range: "'Admin Accounts'!A:J",
-        valueInputOption: 'RAW',
-        insertDataOption: 'INSERT_ROWS',
-        requestBody: { values: [row] }
-      });
-    }
-  }
 }
 async function syncAdminAuditSheet() {
-  await ensureSecuritySheets();
-  const response = await getSheets().spreadsheets.values.get({
+  const { schemas } = await ensureSecuritySheets();
+  const schema = schemas.get('Admin Audit Log');
+  if (!schema) return;
+  const entries = listAdminAuditLog(authDb, 10000).reverse();
+  await syncSheetRowsById({
+    service: getSheets(),
     spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
-    range: "'Admin Audit Log'!A2:J10000"
+    title: 'Admin Audit Log',
+    schema,
+    idHeader: 'Audit ID',
+    records: entries,
+    fieldsForRecord: (entry) => ({
+      'Audit ID': entry.id,
+      Timestamp: entry.timestamp,
+      'Admin ID': entry.adminId,
+      'Admin Email': entry.adminEmail,
+      Action: entry.action,
+      'Affected Record': entry.affectedRecord,
+      Reason: entry.reason,
+      'Acting Admin Role': entry.actingAdminRole || 'ADMIN',
+      'Target Admin ID': entry.targetAdminId || '',
+      Result: entry.result || 'success'
+    }),
+    onDuplicate: (count) => console.warn(`Skipping duplicate Audit ID entries in "Admin Audit Log" (${count} duplicates).`),
+    onSkipped: (reason) => console.warn(`Skipping Google Sheets sync for "Admin Audit Log": ${reason}; no cells were modified.`)
   });
-  const existingRows = new Map((response.data.values || []).map((row, index) => [row[0], { row, sheetRow: index + 2 }]));
-  const updates = [];
-  const rows = [];
-  for (const entry of listAdminAuditLog(authDb, 10000).reverse()) {
-    const row = [
-      entry.id, entry.timestamp, entry.adminId, entry.adminEmail,
-      entry.action, entry.affectedRecord, entry.reason,
-      entry.actingAdminRole || 'ADMIN', entry.targetAdminId || '', entry.result || 'success'
-    ];
-    const existing = existingRows.get(entry.id);
-    if (!existing) {
-      rows.push(row);
-    } else if (row.some((value, index) => String(existing.row[index] || '') !== String(value))) {
-      updates.push({ range: `'Admin Audit Log'!A${existing.sheetRow}:J${existing.sheetRow}`, values: [row] });
-    }
-  }
-  if (updates.length) {
-    await getSheets().spreadsheets.values.batchUpdate({
-      spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
-      requestBody: { valueInputOption: 'RAW', data: updates }
-    });
-  }
-  if (rows.length) {
-    await getSheets().spreadsheets.values.append({
-      spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID,
-      range: "'Admin Audit Log'!A:J",
-      valueInputOption: 'RAW',
-      insertDataOption: 'INSERT_ROWS',
-      requestBody: { values: rows }
-    });
-  }
 }
 async function styleAttendanceSheets() {
   const metadata = await readSheetsMetadata('sheets.properties.title,sheets.properties.sheetId');
@@ -1152,16 +1105,6 @@ async function syncAttendanceValidation() {
     }
   }
   for (let index = 0; index < requests.length; index += 500) await getSheets().spreadsheets.batchUpdate({ spreadsheetId: process.env.GOOGLE_SPREADSHEET_ID, requestBody: { requests: requests.slice(index, index + 500) } });
-}
-function columnName(index) {
-  let value = '';
-  let current = index + 1;
-  while (current > 0) {
-    const remainder = (current - 1) % 26;
-    value = String.fromCharCode(65 + remainder) + value;
-    current = Math.floor((current - 1) / 26);
-  }
-  return value;
 }
 async function copyDateColumnFormatting(subject, sourceIndex, destinationIndex, insertColumn = false, validationEndRow = 1000, knownSheetId = null) {
   const targetSheet = resolveSubjectSheetTitle(subject);
