@@ -50,8 +50,8 @@ Copy-Item .env.example .env
 Edit `.env`:
 
 - `JWT_SECRET`: a random secret of at least 32 characters used to sign session cookies. Required in production; local development generates an ephemeral value if omitted.
-- `DATABASE_URL`: SQLite database file path; defaults to `./data/attendance.sqlite`. Keep the data directory on persistent storage.
-- `DEVICE_LOCKS_PATH`: optional JSON path for legacy migration and per-session locks. Keep it on persistent storage when deploying (for example `/var/data/.device-locks.json`); active student-device ownership is stored in the SQLite database.
+- `DATABASE_URL`: SQLite database file path; defaults to `./data/attendance.sqlite`. Keep the data directory on persistent storage where available. Render Free uses temporary storage, so its SQLite data may be lost after a restart or redeployment.
+- `DEVICE_LOCKS_PATH`: optional JSON path for legacy migration and per-session locks. Keep it on persistent storage where available (for example `/var/data/.device-locks.json` on a host with a disk); Render Free uses `/tmp/attendance-data/.device-locks.json`, which is temporary. Active student-device ownership is stored in the SQLite database.
 - `TRUST_PROXY_HOPS`: number of trusted reverse-proxy hops used to determine `req.ip`; defaults to `1` in production and `0` locally. Render sets it to `1`; do not raise it unless the deployment's proxy chain requires it.
 - `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM`: SMTP delivery-service settings. `SMTP_USER` is the sender account, not an admin identity. `SMTP_FROM` is the sender email address; outgoing email displays "Attendance Management System" as the sender name. Use your provider's app password. The app logs a clear warning if email delivery is not configured; SMTP credentials remain server-side.
 - `GOOGLE_SPREADSHEET_ID`: spreadsheet ID.
@@ -128,19 +128,19 @@ Email is sent through one backend service with reusable, responsive HTML and pla
 
 Close a session only after the class is finished. Past records are not exposed through correction controls. Google Sheets itself should be restricted to trusted administrators.
 
-Keep the SQLite database on persistent storage (`DATABASE_URL`); it now contains the authoritative device registry and admin audit history as well as admin authentication data. The existing `DEVICE_LOCKS_PATH` remains for the older per-session lock data and is also read once to migrate legacy student-device locks. Back up both SQLite and device-lock storage.
+The SQLite database (`DATABASE_URL`) contains the authoritative device registry, admin audit history, and admin authentication data. The existing `DEVICE_LOCKS_PATH` stores older per-session lock data and is also read once to migrate legacy student-device locks. Keep both paths on persistent storage where available and back them up. On Render Free, the configured `/tmp/attendance-data` paths are temporary; database contents, admin accounts and setup, device registrations, audit history, and lock files may be lost after a restart or redeployment.
 
 ## Deploy publicly on Render
 
-The development address (for example, `192.168.x.x`) is private to your local network. To let phones on other networks scan attendance QR codes, deploy the app to a public HTTPS host. This repository includes a `render.yaml` blueprint that creates one Render web service and mounts persistent storage for the SQLite database and device bindings. A paid Render service plan is required for the persistent disk; do not use an ephemeral filesystem for the database.
+The development address (for example, `192.168.x.x`) is private to your local network. To let phones on other networks scan attendance QR codes, deploy the app to a public HTTPS host. This repository includes a `render.yaml` blueprint for a Render Free web service. It stores SQLite and device-lock files under `/tmp/attendance-data` and does not request a persistent disk. Render Free storage is ephemeral: those files, including admin accounts, Main Admin setup, device registrations, and audit history in SQLite, may be lost after a restart or redeployment. Attendance records already written to Google Sheets remain there, but the app's local authorization and device state is not backed up by Sheets. Use this setup only if you accept that risk.
 
 1. Push this repository to GitHub and create a new Blueprint on Render using that repository and its `render.yaml`.
 2. During setup, provide `GOOGLE_SPREADSHEET_ID`, `GOOGLE_SERVICE_ACCOUNT_JSON`, and `MAIN_ADMIN_BOOTSTRAP_SECRET`. Generate the bootstrap value with a password manager or a cryptographically secure random generator; use at least 32 random characters and keep it separate from `JWT_SECRET`. The service account must have Editor access to the spreadsheet. In Render, enter the service-account JSON as one value; keep all secrets private.
 3. Wait for deployment, then open the service's public `https://<service-name>.onrender.com` URL and initialize/claim the single Main Admin using the bootstrap secret. Complete email verification for a newly created Main Admin. Configure the optional SMTP settings so OTP and recovery delivery work.
 4. If Render did not set `APP_URL`, it can be left unset: QR links use the incoming public host and HTTPS forwarded by Render. Alternatively set it to the exact public HTTPS service URL. Generate a fresh QR after deployment; QR sessions are held in memory and do not survive a service restart.
-5. Keep the service to one running instance. This app uses in-memory active QR sessions and process-local rate limits, and it stores SQLite plus per-session device locks on the attached persistent disk. Back up the disk data regularly.
+5. Keep the service to one running instance. This app uses in-memory active QR sessions and process-local rate limits. On Render Free, SQLite and per-session device locks are stored in temporary `/tmp/attendance-data`; do not rely on them as permanent storage.
 
-For any production host, use HTTPS, keep `JWT_SECRET` private, and keep both `DATABASE_URL` and `DEVICE_LOCKS_PATH` on persistent storage. Configure `TRUST_PROXY_HOPS` to match the known proxy chain. Never commit `.env` or place service-account credentials in `public/`. The admin cookie is HttpOnly, SameSite=Strict, signed, and expires after eight hours.
+For production hosts with persistent storage, keep `DATABASE_URL` and `DEVICE_LOCKS_PATH` on that storage. Render Free uses temporary storage for these paths, so local admin and device state can be lost. Use HTTPS, keep `JWT_SECRET` private, and configure `TRUST_PROXY_HOPS` to match the known proxy chain. Never commit `.env` or place service-account credentials in `public/`. The admin cookie is HttpOnly, SameSite=Strict, signed, and expires after eight hours.
 
 ## Smoke test checklist
 

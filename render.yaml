@@ -2,14 +2,10 @@ services:
   - type: web
     name: rollcall-attendance
     runtime: node
-    plan: starter
+    plan: free
     buildCommand: npm ci
     startCommand: npm start
     healthCheckPath: /
-    disk:
-      name: attendance-data
-      mountPath: /var/data
-      sizeGB: 1
     envVars:
       - key: NODE_ENV
         value: production
@@ -18,9 +14,9 @@ services:
       - key: MAIN_ADMIN_BOOTSTRAP_SECRET
         sync: false
       - key: DATABASE_URL
-        value: /var/data/attendance.sqlite
+        value: /tmp/attendance-data/attendance.sqlite
       - key: DEVICE_LOCKS_PATH
-        value: /var/data/.device-locks.json
+        value: /tmp/attendance-data/.device-locks.json
       - key: QR_MINUTES
         value: "30"
       - key: TRUST_PROXY_HOPS

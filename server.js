@@ -140,6 +140,7 @@ async function loadDeviceLocksFromDisk() {
   }
 }
 async function persistDeviceLocks() {
+  fs.mkdirSync(path.dirname(DEVICE_LOCKS_PATH), { recursive: true });
   await fs.promises.writeFile(DEVICE_LOCKS_PATH, JSON.stringify({
     deviceAttendanceLocks: Object.fromEntries(deviceAttendanceLocks)
   }, null, 2), 'utf8');
