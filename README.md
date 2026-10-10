@@ -116,6 +116,29 @@ Set `MAIN_ADMIN_BOOTSTRAP_SECRET` to a separate random value of at least 32 char
 
 This procedure does not repair a forgotten password, an unverified/inactive account, or broken email delivery. Recover those first through the existing password-reset/OTP and email-provider configuration. The generated SQLite backup is only an additional local rollback point: copy it to secure storage outside the Render instance before restarting or redeploying. On Render Free, both the live SQLite file and the backup under `/tmp` are ephemeral and may disappear; do not treat either as a permanent backup. To roll back before that happens, stop the service and restore the backup over the SQLite database, then restart. No production reset is run by deployment or application startup.
 
+### Explicit reset of all administrator access
+
+Use `node scripts/reset-admin-accounts.js` only when all admin credentials must be revoked and a new Main Admin must be initialized. This is a separate, operator-run CLI; it is not called during startup or deployment. It requires the configured `MAIN_ADMIN_BOOTSTRAP_SECRET` and reads it from a protected interactive terminal rather than accepting it as a command-line argument. It refuses to operate on an unexpected schema or a database with foreign-key violations.
+
+First stop or suspend the application during a maintenance window so no user can register or authenticate while the reset is being prepared. Run the default dry-run and review the counts before proceeding:
+
+```text
+node scripts/reset-admin-accounts.js --dry-run
+node scripts/reset-admin-accounts.js --backup-only
+```
+
+Copy the backup reported by `--backup-only` to secure durable storage outside the Render instance and verify that it is retained there. Only then, after an authorized operator explicitly approves the displayed impact, apply the reset:
+
+```text
+node scripts/reset-admin-accounts.js --apply
+```
+
+Apply mode makes a fresh SQLite online backup beside the database, validates its integrity and foreign keys, then runs the reset transaction. Admin rows are retained as anonymized tombstones so audit and foreign-key references remain valid; credentials, sessions, OTP challenges, and subject assignments are revoked. Main Admin assignment is cleared, access-request details tied to these accounts are anonymized, and identifying text in their audit events is redacted while the audit events themselves remain. Student, attendance, subject, device-registry, legacy device-lock, and unrelated database rows are preserved. The utility does not connect to Google Sheets or modify any spreadsheet. Its dry-run and backup modes do not change database rows, and rerunning apply is safe.
+
+After applying the reset, restart the application and use **Set up Main Admin** with a new password and the bootstrap secret. The setup page now permits creation when no verified, active, approved admin can claim the assignment, even if anonymized admin tombstones remain. The Main Admin account is not usable until its verification OTP is successfully delivered and accepted. If delivery fails, setup is rolled back and can be retried; fix the email provider first rather than bypassing verification. Then create regular admins through the normal signup/invitation flow and verify/approve them as usual. The bootstrap remains one-time and duplicate Main Admin setup is rejected.
+
+This operation revokes every admin account, including any otherwise recoverable account, and anonymizes its email/phone/profile fields. Prefer the narrower `reset-main-admin.js` claim-recovery procedure above when an existing verified account can safely become Main Admin. Do not perform the all-admin reset just to resolve email-delivery or Google Sheets errors. The reset does not repair either integration, and a 10-column sheet with an unknown header order continues to be skipped safely. Local tests exercise only temporary databases and mocked mail; they do not verify production email configuration or authorize a production reset.
+
 For Render Free, configure `DATABASE_URL=/tmp/attendance-data/attendance.sqlite` and `DEVICE_LOCKS_PATH=/tmp/attendance-data/.device-locks.json`; no persistent disk is required. These paths are temporary. Also configure `JWT_SECRET` (at least 32 random characters), `MAIN_ADMIN_BOOTSTRAP_SECRET` (a separate value of at least 32 characters), `EMAIL_PROVIDER=resend`, `EMAIL_FROM` on a domain verified with Resend, and `RESEND_API_KEY`. Configure `GOOGLE_SPREADSHEET_ID` and `GOOGLE_SERVICE_ACCOUNT_JSON` with the production spreadsheet ID and complete service-account JSON; do not use a local Windows file path on Render. SMTP remains optional when `EMAIL_PROVIDER=smtp`; provide `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASSWORD` (a Gmail App Password for Gmail), and a valid `EMAIL_FROM` or legacy `SMTP_FROM`.
 
 Database migration v6 adds a `must_change_password` flag for one-time temporary credentials. It is additive and does not rebuild or delete existing accounts, attendance, device data, or legacy admin access-request rows. Migration v5 may have created a legacy access-request table, but the public request and review flows are no longer exposed or used. Migration v4 adds the singleton Main Admin assignment and status/removal timestamps and extends existing audit metadata. Existing `Admin Accounts` and `Admin Audit Log` worksheet headers are extended only when they exactly match the known older format; unexpected headers are not overwritten. SQLite remains authoritative for authorization and audit records.

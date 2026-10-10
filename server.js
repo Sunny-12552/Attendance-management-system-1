@@ -1959,7 +1959,12 @@ app.get('/api/me', (req, res) => {
   });
 });
 app.get('/api/auth/status', (req, res) => {
-  const hasAdmins = !!authDb.prepare('SELECT 1 AS present FROM admins LIMIT 1').get();
+  const hasClaimableAdmins = !!authDb.prepare(`
+    SELECT 1 AS present FROM admins
+    WHERE is_verified = 1 AND is_active = 1 AND approval_status = 'approved'
+      AND removed_at IS NULL AND password_hash IS NOT NULL
+    LIMIT 1
+  `).get();
   const mainAdmin = authDb.prepare(`
     SELECT main_admin_config.admin_id, admins.is_verified
     FROM main_admin_config
@@ -1969,7 +1974,7 @@ app.get('/api/auth/status', (req, res) => {
   const pendingMainAdminVerification = !!mainAdmin?.admin_id && !mainAdmin.is_verified;
   res.json({
     firstAdminSetupRequired: !mainAdmin?.admin_id,
-    bootstrapMode: hasAdmins ? 'claim' : 'create',
+    bootstrapMode: hasClaimableAdmins ? 'claim' : 'create',
     bootstrapAvailable: mainAdminBootstrapSecret.length >= 32,
     pendingMainAdminVerification
   });
@@ -1985,8 +1990,9 @@ app.post('/api/auth/bootstrap', async (req, res) => {
   if (mainAdminId) return bad(res, 409, 'Main Admin setup has already been completed.');
 
   if (existingAdmin) {
-    if (!existingAdmin.is_verified || !existingAdmin.is_active || existingAdmin.removed_at || !existingAdmin.password_hash) {
-      return bad(res, 403, 'Use an existing verified, active admin account to claim Main Admin access.');
+    if (!existingAdmin.is_verified || !existingAdmin.is_active || existingAdmin.approval_status !== 'approved'
+      || existingAdmin.removed_at || !existingAdmin.password_hash) {
+      return bad(res, 403, 'Use an existing verified, active, approved admin account to claim Main Admin access.');
     }
     const passwordMatches = existingAdmin.password_hash.startsWith('scrypt$')
       ? await (async () => {
@@ -2041,7 +2047,12 @@ app.post('/api/auth/bootstrap', async (req, res) => {
       if (authDb.prepare('SELECT 1 AS present FROM main_admin_config WHERE singleton = 1 AND admin_id IS NOT NULL').get()) {
         throw new Error('Main Admin setup has already been completed.');
       }
-      if (authDb.prepare('SELECT 1 AS present FROM admins LIMIT 1').get()) {
+      if (authDb.prepare(`
+        SELECT 1 AS present FROM admins
+        WHERE is_verified = 1 AND is_active = 1 AND approval_status = 'approved'
+          AND removed_at IS NULL AND password_hash IS NOT NULL
+        LIMIT 1
+      `).get()) {
         const error = new Error('An existing admin account must claim Main Admin setup.');
         error.code = 'MAIN_ADMIN_ALREADY_INITIALIZED';
         throw error;

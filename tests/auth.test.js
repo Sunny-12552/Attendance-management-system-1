@@ -8,6 +8,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { test } from 'node:test';
 import bcrypt from 'bcryptjs';
 import Database from 'better-sqlite3';
+import { runAdminAccountsReset } from '../scripts/reset-admin-accounts.js';
 
 function createSmtpSink() {
   const codes = [];
@@ -80,12 +81,13 @@ function createSmtpSink() {
   };
 }
 
-async function jsonRequest(baseUrl, route, { method = 'GET', body, cookie } = {}) {
+async function jsonRequest(baseUrl, route, { method = 'GET', body, cookie, headers: extraHeaders = {} } = {}) {
   const response = await fetch(`${baseUrl}${route}`, {
     method,
     headers: {
       ...(body ? { 'content-type': 'application/json' } : {}),
-      ...(cookie ? { cookie } : {})
+      ...(cookie ? { cookie } : {}),
+      ...extraHeaders
     },
     ...(body ? { body: JSON.stringify(body) } : {})
   });
@@ -180,8 +182,6 @@ test('admins sign up, verify by OTP, invite accounts, and persist secure session
   assert.ok(smtp.recipients.includes(initialAdmin.email), 'the OTP is delivered to the registering admin email');
   assert.equal(JSON.stringify(result.body).includes(firstCode), false);
   assert.equal((await jsonRequest(baseUrl, '/api/auth/status')).body.firstAdminSetupRequired, false);
-  result = await jsonRequest(baseUrl, '/api/auth/bootstrap', { method: 'POST', body: initialAdmin });
-  assert.equal(result.status, 409, 'Main Admin bootstrap cannot be repeated');
   result = await jsonRequest(baseUrl, '/api/auth/signup', {
     method: 'POST',
     body: {
@@ -994,4 +994,48 @@ test('admins sign up, verify by OTP, invite accounts, and persist secure session
       && entry.affectedRecord !== 'admin-two@example.test'
       && !entry.reason.includes('admin-two@example.test')),
   'removed admin audit events no longer expose their email');
+
+  const resetResult = await runAdminAccountsReset({
+    databasePath,
+    configuredSecret: process.env.MAIN_ADMIN_BOOTSTRAP_SECRET,
+    suppliedSecret: process.env.MAIN_ADMIN_BOOTSTRAP_SECRET,
+    apply: true
+  });
+  assert.equal(resetResult.changed, true);
+  status = await jsonRequest(baseUrl, '/api/auth/status');
+  assert.equal(status.body.bootstrapMode, 'create', 'tombstoned admins do not block a fresh Main Admin setup');
+  assert.equal(status.body.firstAdminSetupRequired, true);
+  assert.equal((await jsonRequest(baseUrl, '/api/auth/login', {
+    method: 'POST',
+    body: { email: initialAdmin.email, password: 'UpdatedFirstAdminPassword!' }
+  })).status, 401, 'reset admin credentials and sessions are no longer usable');
+
+  const recoveredMainAdmin = {
+    name: 'Recovered Main Administrator',
+    email: initialAdmin.email,
+    password: 'RecoveredMainAdminPassword!',
+    confirmPassword: 'RecoveredMainAdminPassword!',
+    bootstrapSecret: process.env.MAIN_ADMIN_BOOTSTRAP_SECRET
+  };
+  result = await jsonRequest(baseUrl, '/api/auth/bootstrap', { method: 'POST', body: recoveredMainAdmin });
+  assert.equal(result.status, 201, 'a new Main Admin can be initialized after the authorized reset');
+  const recoveredCode = await smtp.nextCode();
+  result = await jsonRequest(baseUrl, '/api/auth/verify-otp', {
+    method: 'POST',
+    body: { purpose: 'verify', email: recoveredMainAdmin.email, code: recoveredCode }
+  });
+  assert.equal(result.status, 200, 'new Main Admin verification succeeds after delivery');
+  const recoveredLogin = await jsonRequest(baseUrl, '/api/auth/login', {
+    method: 'POST',
+    body: { email: recoveredMainAdmin.email, password: recoveredMainAdmin.password }
+  });
+  assert.equal(recoveredLogin.status, 200, 'verified Main Admin can log in after recovery');
+  assert.equal((await jsonRequest(baseUrl, '/api/me', { cookie: recoveredLogin.cookie })).body.admin.role, 'MAIN_ADMIN');
+  app.set('trust proxy', 1);
+  result = await jsonRequest(baseUrl, '/api/auth/bootstrap', {
+    method: 'POST',
+    body: recoveredMainAdmin,
+    headers: { 'x-forwarded-for': '192.0.2.42' }
+  });
+  assert.equal(result.status, 409, 'fresh Main Admin initialization remains one-time only');
 });
