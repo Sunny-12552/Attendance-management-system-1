@@ -14,10 +14,15 @@ function smtpEmailConfig() {
   const password = String(process.env.SMTP_PASSWORD || '');
   const from = String(process.env.EMAIL_FROM || process.env.SMTP_FROM || '').trim();
   const port = Number(process.env.SMTP_PORT || 587);
-  if (!host || !user || !password || !isValidEmailAddress(from) || !Number.isInteger(port) || port < 1 || port > 65535) {
+  const secureValue = String(process.env.SMTP_SECURE || 'false').trim().toLowerCase();
+  if (
+    !host || !user || !password || !isValidEmailAddress(from)
+    || !Number.isInteger(port) || port < 1 || port > 65535
+    || !['true', 'false'].includes(secureValue)
+  ) {
     return null;
   }
-  return { host, user, password, from, port, secure: process.env.SMTP_SECURE === 'true' };
+  return { host, user, password, from, port, secure: secureValue === 'true' };
 }
 
 function resendEmailConfig() {
@@ -41,16 +46,42 @@ export function isEmailConfigured() {
 export function emailConfigurationMessage() {
   const provider = emailProvider();
   if (provider === 'resend') {
-    return 'Email service is not configured. Set RESEND_API_KEY and a valid EMAIL_FROM address for Resend.';
+    const missing = [
+      ...(!String(process.env.RESEND_API_KEY || '').trim() ? ['RESEND_API_KEY'] : []),
+      ...(!isValidEmailAddress(String(process.env.EMAIL_FROM || '').trim()) ? ['a valid EMAIL_FROM'] : [])
+    ];
+    return `Email service is not configured for Resend. Set ${missing.join(' and ')}.`;
   }
   if (provider === 'smtp') {
-    return 'Email service is not configured. Set EMAIL_FROM (or SMTP_FROM) and valid SMTP settings.';
+    const missing = [
+      ...(!String(process.env.SMTP_HOST || '').trim() ? ['SMTP_HOST'] : []),
+      ...(!String(process.env.SMTP_USER || '').trim() ? ['SMTP_USER'] : []),
+      ...(!String(process.env.SMTP_PASSWORD || '') ? ['SMTP_PASSWORD'] : []),
+      ...(!isValidEmailAddress(String(process.env.EMAIL_FROM || process.env.SMTP_FROM || '').trim())
+        ? ['a valid EMAIL_FROM (or SMTP_FROM)']
+        : []),
+      ...(!Number.isInteger(Number(process.env.SMTP_PORT || 587))
+        || Number(process.env.SMTP_PORT || 587) < 1
+        || Number(process.env.SMTP_PORT || 587) > 65535
+        ? ['a valid SMTP_PORT']
+        : []),
+      ...(!['true', 'false'].includes(String(process.env.SMTP_SECURE || 'false').trim().toLowerCase())
+        ? ['SMTP_SECURE set to "true" or "false"']
+        : [])
+    ];
+    return `Email service is not configured for SMTP. Set ${missing.join(', ')}.`;
   }
   return 'Email service is not configured. Set EMAIL_PROVIDER to "resend" or "smtp".';
 }
 
 export function emailDeliveryErrorMessage(error) {
   if (error?.code === 'EMAIL_NOT_CONFIGURED') return emailConfigurationMessage();
+  if (error?.code === 'OTP_RATE_LIMITED') return 'Please wait one minute before requesting another code.';
+  if (error?.code === 'EMAIL_DELIVERY_TIMEOUT') {
+    return emailProvider() === 'resend'
+      ? 'The Resend request timed out. Check network access and Resend status, then retry.'
+      : 'The SMTP server timed out. Check the host, port, TLS settings, and network access, then retry.';
+  }
   if (error?.code === 'EMAIL_AUTH_FAILED') {
     if (emailProvider() === 'resend') {
       return 'Resend rejected the API key. Check RESEND_API_KEY in the deployment environment.';
@@ -60,7 +91,13 @@ export function emailDeliveryErrorMessage(error) {
       : 'The email server rejected the sender login. Check SMTP_USER and SMTP_PASSWORD in .env, then restart the app.';
   }
   if (emailProvider() === 'resend') {
-    return 'Unable to deliver email through Resend. Check the sender domain and Resend configuration, then try again.';
+    if (error?.status === 403) {
+      return 'Resend rejected this request. Check API-key permissions, sender-domain verification, and recipient restrictions.';
+    }
+    if (error?.status === 422) {
+      return 'Resend rejected the sender or recipient. Verify the sender domain and confirm that the recipient is allowed for this account.';
+    }
+    return 'Unable to deliver email through Resend. Check network access, sender-domain verification, and recipient restrictions, then try again.';
   }
   return 'Unable to deliver the email. Please check the SMTP settings and try again.';
 }
@@ -77,7 +114,10 @@ function getTransport() {
       host: config.host,
       port: config.port,
       secure: config.secure,
-      auth: { user: config.user, pass: config.password }
+      auth: { user: config.user, pass: config.password },
+      connectionTimeout: 10_000,
+      greetingTimeout: 10_000,
+      socketTimeout: 20_000
     });
   }
   return {
@@ -104,17 +144,17 @@ async function sendWithResend(config, to, emailMessage) {
       }),
       signal: AbortSignal.timeout(15000)
     });
-  } catch {
+  } catch (cause) {
     const error = new Error('The Resend API request failed.');
-    error.code = 'EMAIL_DELIVERY_FAILED';
+    error.code = cause?.name === 'AbortError' || cause?.name === 'TimeoutError'
+      ? 'EMAIL_DELIVERY_TIMEOUT'
+      : 'EMAIL_DELIVERY_FAILED';
     throw error;
   }
 
   if (!response.ok) {
     const error = new Error('The Resend API rejected the email request.');
-    error.code = response.status === 401 || response.status === 403
-      ? 'EMAIL_AUTH_FAILED'
-      : 'EMAIL_DELIVERY_FAILED';
+    error.code = response.status === 401 ? 'EMAIL_AUTH_FAILED' : 'EMAIL_DELIVERY_FAILED';
     error.status = response.status;
     throw error;
   }
@@ -338,10 +378,15 @@ export async function sendEmail(to, emailMessage) {
       || error.responseCode === 534
       || error.responseCode === 535
       || /invalid login|application-specific password|authentication failed/i.test(error.message || '');
+    const timedOut = error.code === 'ETIMEDOUT'
+      || ((error.code === 'ESOCKET' || error.code === 'ECONNECTION')
+        && /timed?\s*out|timeout/i.test(error.message || ''));
     const deliveryError = new Error(authFailure
       ? 'The SMTP server rejected authentication.'
-      : 'Unable to send email.');
-    deliveryError.code = authFailure ? 'EMAIL_AUTH_FAILED' : 'EMAIL_DELIVERY_FAILED';
+      : timedOut ? 'The SMTP server timed out.' : 'Unable to send email.');
+    deliveryError.code = authFailure
+      ? 'EMAIL_AUTH_FAILED'
+      : timedOut ? 'EMAIL_DELIVERY_TIMEOUT' : 'EMAIL_DELIVERY_FAILED';
     throw deliveryError;
   }
 }

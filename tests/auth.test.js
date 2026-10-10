@@ -112,6 +112,8 @@ test('admins sign up, verify by OTP, invite accounts, and persist secure session
   process.env.SMTP_USER = 'test-smtp-user';
   process.env.SMTP_PASSWORD = 'test-smtp-password';
   process.env.SMTP_FROM = 'attendance-test@example.test';
+  process.env.EMAIL_PROVIDER = 'smtp';
+  process.env.EMAIL_FROM = 'attendance-test@example.test';
   process.env.APP_URL = 'https://attendance.example.test';
   process.env.QR_MINUTES = '30';
   process.env.SUBJECTS = 'Python,Java';
@@ -135,7 +137,7 @@ test('admins sign up, verify by OTP, invite accounts, and persist secure session
     closeAuthDatabase();
     await new Promise((resolve) => smtp.server.close(resolve));
     fs.rmSync(temporaryDirectory, { recursive: true, force: true });
-    for (const key of ['NODE_ENV', 'DATABASE_URL', 'JWT_SECRET', 'MAIN_ADMIN_BOOTSTRAP_SECRET', 'SMTP_HOST', 'SMTP_PORT', 'SMTP_SECURE', 'SMTP_USER', 'SMTP_PASSWORD', 'SMTP_FROM', 'APP_URL', 'QR_MINUTES', 'SUBJECTS', 'GOOGLE_SPREADSHEET_ID', 'GOOGLE_SERVICE_ACCOUNT_FILE', 'GOOGLE_SERVICE_ACCOUNT_JSON']) {
+    for (const key of ['NODE_ENV', 'DATABASE_URL', 'JWT_SECRET', 'MAIN_ADMIN_BOOTSTRAP_SECRET', 'EMAIL_PROVIDER', 'EMAIL_FROM', 'RESEND_API_KEY', 'SMTP_HOST', 'SMTP_PORT', 'SMTP_SECURE', 'SMTP_USER', 'SMTP_PASSWORD', 'SMTP_FROM', 'APP_URL', 'QR_MINUTES', 'SUBJECTS', 'GOOGLE_SPREADSHEET_ID', 'GOOGLE_SERVICE_ACCOUNT_FILE', 'GOOGLE_SERVICE_ACCOUNT_JSON']) {
       delete process.env[key];
     }
   });
@@ -155,6 +157,21 @@ test('admins sign up, verify by OTP, invite accounts, and persist secure session
     body: { ...initialAdmin, bootstrapSecret: 'incorrect-bootstrap-secret-that-is-at-least-32-characters' }
   });
   assert.equal(result.status, 403, 'invalid bootstrap secrets must be rejected');
+  const originalFetch = globalThis.fetch;
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    if (String(url) === 'https://api.resend.com/emails') {
+      return new Response(JSON.stringify({ message: 'test rejection' }), { status: 503 });
+    }
+    return originalFetch(url, options);
+  });
+  process.env.EMAIL_PROVIDER = 'resend';
+  process.env.RESEND_API_KEY = 'test-resend-api-key';
+  result = await jsonRequest(baseUrl, '/api/auth/bootstrap', { method: 'POST', body: initialAdmin });
+  assert.equal(result.status, 503, 'a failed verification email must fail Main Admin setup');
+  assert.equal((await jsonRequest(baseUrl, '/api/auth/status')).body.firstAdminSetupRequired, true,
+    'failed email delivery must leave Main Admin setup available');
+  process.env.EMAIL_PROVIDER = 'smtp';
+  delete process.env.RESEND_API_KEY;
   result = await jsonRequest(baseUrl, '/api/auth/bootstrap', { method: 'POST', body: initialAdmin });
   assert.equal(result.status, 201);
   assert.equal(result.body.otpPurpose, 'verify');
@@ -187,6 +204,22 @@ test('admins sign up, verify by OTP, invite accounts, and persist secure session
   const firstOtpHash = inspectionDb.prepare('SELECT otp_hash FROM otp_verifications WHERE admin_id = (SELECT id FROM admins WHERE email = ?)').get(initialAdmin.email).otp_hash;
   assert.notEqual(pendingFirst.password_hash, initialAdmin.password);
   assert.notEqual(firstOtpHash, firstCode);
+  inspectionDb.prepare('UPDATE otp_verifications SET last_sent_at = 0 WHERE admin_id = (SELECT id FROM admins WHERE email = ?)').run(initialAdmin.email);
+  process.env.EMAIL_PROVIDER = 'resend';
+  process.env.RESEND_API_KEY = 'test-resend-api-key';
+  result = await jsonRequest(baseUrl, '/api/auth/resend-otp', {
+    method: 'POST',
+    body: { purpose: 'verify', email: initialAdmin.email }
+  });
+  assert.equal(result.status, 503, 'a failed resend must be reported as a delivery failure');
+  assert.equal(
+    inspectionDb.prepare('SELECT otp_hash FROM otp_verifications WHERE admin_id = (SELECT id FROM admins WHERE email = ?)').get(initialAdmin.email).otp_hash,
+    firstOtpHash,
+    'a failed resend must preserve the previously delivered OTP'
+  );
+  process.env.EMAIL_PROVIDER = 'smtp';
+  delete process.env.RESEND_API_KEY;
+  inspectionDb.prepare('UPDATE otp_verifications SET last_sent_at = ? WHERE admin_id = (SELECT id FROM admins WHERE email = ?)').run(Date.now(), initialAdmin.email);
   result = await jsonRequest(baseUrl, '/api/auth/resend-otp', {
     method: 'POST',
     body: { purpose: 'verify', email: initialAdmin.email }
@@ -232,11 +265,14 @@ test('admins sign up, verify by OTP, invite accounts, and persist secure session
   });
   assert.equal(result.status, 200);
   const verifiedFirstCode = await smtp.nextCode();
-  result = await jsonRequest(baseUrl, '/api/auth/verify-otp', {
+  const simultaneousVerifications = await Promise.all([1, 2].map(() => jsonRequest(baseUrl, '/api/auth/verify-otp', {
     method: 'POST',
     body: { purpose: 'verify', email: initialAdmin.email, code: verifiedFirstCode }
-  });
-  assert.equal(result.status, 200);
+  })));
+  assert.equal(simultaneousVerifications.filter((entry) => entry.status === 200).length, 1,
+    'an OTP can only be consumed once, even by simultaneous verification requests');
+  assert.equal(simultaneousVerifications.filter((entry) => entry.status === 400).length, 1);
+  result = simultaneousVerifications.find((entry) => entry.status === 200);
   assert.equal(result.body.emailNotification, 'sent');
   const welcomeMessage = smtp.messages.find((mail) => mail.includes('Subject: Welcome to the Attendance Management System'));
   assert.ok(welcomeMessage);
@@ -392,11 +428,10 @@ test('admins sign up, verify by OTP, invite accounts, and persist secure session
   });
   assert.equal(result.status, 200);
   assert.equal(result.body.requiresOtp, true);
-  assert.equal(result.body.otpDelivery, 'sent', 'Give Access sends a fresh verification OTP');
+  assert.equal(result.body.otpDelivery, 'already-sent', 'approval reuses a still-valid verification OTP');
   assert.equal(result.body.active, false, 'Main Admin approval must not activate an unverified account');
   assert.equal(inspectionDb.prepare('SELECT is_active FROM admins WHERE id = ?').get(unverifiedAdminId).is_active, 0);
-  const unverifiedAdminCode = await smtp.nextCode();
-  assert.notEqual(unverifiedAdminCode, initialUnverifiedOtp, 'approval replaces an earlier OTP with the newly emailed code');
+  const unverifiedAdminCode = initialUnverifiedOtp;
   assert.equal((await jsonRequest(baseUrl, '/api/auth/login', {
     method: 'POST',
     body: { email: unverifiedAdmin.email, password: unverifiedAdmin.password }

@@ -736,9 +736,11 @@ $('admin-accounts').addEventListener('click', async (event) => {
       const approvalMessage = result.requiresOtp
         ? result.otpDelivery === 'sent'
           ? 'Access approved for all subjects. A fresh email verification OTP has been sent; the admin must verify before signing in.'
+          : result.otpDelivery === 'already-sent'
+            ? 'Access approved for all subjects. The previously sent verification code is still valid; the admin must verify before signing in.'
           : `Access approved, but the verification OTP was not sent. ${result.otpDeliveryMessage || 'Use Resend verification OTP after checking the email service.'}`
         : 'Access granted for all configured subjects. The admin can now sign in.';
-      if (!result.requiresOtp || result.otpDelivery === 'sent') {
+      if (!result.requiresOtp || ['sent', 'already-sent'].includes(result.otpDelivery)) {
         successMessage('admin-invite-message', approvalMessage);
       } else {
         message('admin-invite-message', approvalMessage);

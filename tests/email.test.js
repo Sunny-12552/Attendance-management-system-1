@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
+import { createServer } from 'node:net';
+import { mock, test } from 'node:test';
 import {
   buildAccountStatusEmail,
   buildAbsenceNotificationEmail,
@@ -115,13 +116,14 @@ test('attendance templates render actual attendance and per-subject summary valu
   }
 });
 
-test('SMTP configuration and delivery errors are safe for API responses', async () => {
-  const keys = ['SMTP_HOST', 'SMTP_PORT', 'SMTP_USER', 'SMTP_PASSWORD', 'SMTP_FROM', 'SMTP_SECURE'];
+test('SMTP configuration and delivery errors are safe for API responses', async (t) => {
+  const keys = ['EMAIL_PROVIDER', 'EMAIL_FROM', 'RESEND_API_KEY', 'SMTP_HOST', 'SMTP_PORT', 'SMTP_USER', 'SMTP_PASSWORD', 'SMTP_FROM', 'SMTP_SECURE'];
   const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
   try {
     for (const key of keys) delete process.env[key];
+    process.env.EMAIL_PROVIDER = 'smtp';
     assert.equal(isEmailConfigured(), false);
-    assert.equal(emailConfigurationMessage(), 'Email service is not configured. Please configure SMTP settings.');
+    assert.match(emailConfigurationMessage(), /SMTP_HOST, SMTP_USER, SMTP_PASSWORD/);
     await assert.rejects(
       sendEmail('student@example.test', { subject: 'Test', text: 'Test', html: '<p>Test</p>' }),
       (error) => error.code === 'EMAIL_NOT_CONFIGURED'
@@ -133,6 +135,9 @@ test('SMTP configuration and delivery errors are safe for API responses', async 
     process.env.SMTP_USER = 'private-test-user';
     process.env.SMTP_PASSWORD = 'private-test-password';
     process.env.SMTP_FROM = 'sender@example.test';
+    process.env.SMTP_SECURE = 'maybe';
+    assert.equal(isEmailConfigured(), false);
+    assert.match(emailConfigurationMessage(), /SMTP_SECURE set to "true" or "false"/);
     process.env.SMTP_SECURE = 'false';
     process.env.SMTP_HOST = 'smtp.gmail.com';
     assert.match(
@@ -143,12 +148,114 @@ test('SMTP configuration and delivery errors are safe for API responses', async 
       emailDeliveryErrorMessage({ code: 'EMAIL_AUTH_FAILED' }),
       /private-test-password|smtp\.gmail\.com/
     );
+    assert.match(emailDeliveryErrorMessage({ code: 'EMAIL_DELIVERY_TIMEOUT' }), /SMTP server timed out/);
     process.env.SMTP_HOST = '127.0.0.1';
+    let connectionCount = 0;
+    const sockets = new Set();
+    const stalledServer = createServer((socket) => {
+      connectionCount += 1;
+      sockets.add(socket);
+      socket.on('close', () => sockets.delete(socket));
+      if (connectionCount === 1) socket.destroy();
+    });
+    await new Promise((resolve) => stalledServer.listen(0, '127.0.0.1', resolve));
+    t.after(() => {
+      for (const socket of sockets) socket.destroy();
+      stalledServer.close();
+    });
+    process.env.SMTP_PORT = String(stalledServer.address().port);
     await assert.rejects(
       sendEmail('student@example.test', { subject: 'Test', text: 'Test', html: '<p>Test</p>' }),
       (error) => error.code === 'EMAIL_DELIVERY_FAILED'
         && error.message === 'Unable to send email.'
         && !error.message.includes(process.env.SMTP_PASSWORD)
+    );
+
+    await assert.rejects(
+      sendEmail('student@example.test', { subject: 'Test', text: 'Test', html: '<p>Test</p>' }),
+      (error) => error.code === 'EMAIL_DELIVERY_TIMEOUT'
+        && /SMTP server timed out/i.test(emailDeliveryErrorMessage(error))
+    );
+    await new Promise((resolve) => stalledServer.close(resolve));
+  } finally {
+    for (const key of keys) {
+      if (previous[key] === undefined) delete process.env[key];
+      else process.env[key] = previous[key];
+    }
+  }
+});
+
+test('Resend configuration and HTTPS delivery handle success and API failures', async (t) => {
+  const keys = ['EMAIL_PROVIDER', 'EMAIL_FROM', 'RESEND_API_KEY', 'SMTP_HOST', 'SMTP_PORT', 'SMTP_USER', 'SMTP_PASSWORD', 'SMTP_FROM', 'SMTP_SECURE'];
+  const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  try {
+    for (const key of keys) delete process.env[key];
+    process.env.EMAIL_PROVIDER = 'resend';
+    process.env.RESEND_API_KEY = 'test-resend-api-key';
+    process.env.EMAIL_FROM = 'sender@example.test';
+    assert.equal(isEmailConfigured(), true);
+
+    let status = 200;
+    let networkError;
+    const requests = [];
+    t.mock.method(globalThis, 'fetch', async (url, options) => {
+      requests.push({ url, options });
+      if (networkError) throw networkError;
+      return new Response(JSON.stringify({ id: 'test-email-id' }), { status });
+    });
+
+    const message = {
+      subject: 'Test subject',
+      text: 'Plain-text body',
+      html: '<p>HTML body</p>'
+    };
+    await sendEmail('recipient@example.test', message);
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].url, 'https://api.resend.com/emails');
+    assert.equal(requests[0].options.method, 'POST');
+    assert.equal(requests[0].options.headers.Authorization, 'Bearer test-resend-api-key');
+    assert.deepEqual(JSON.parse(requests[0].options.body), {
+      from: 'Attendance Management System <sender@example.test>',
+      to: 'recipient@example.test',
+      ...message
+    });
+
+    status = 422;
+    await assert.rejects(
+      sendEmail('recipient@example.test', message),
+      (error) => error.code === 'EMAIL_DELIVERY_FAILED'
+        && emailDeliveryErrorMessage(error).includes('sender domain')
+        && !emailDeliveryErrorMessage(error).includes('test-resend-api-key')
+    );
+
+    status = 401;
+    await assert.rejects(
+      sendEmail('recipient@example.test', message),
+      (error) => error.code === 'EMAIL_AUTH_FAILED'
+        && /check RESEND_API_KEY/i.test(emailDeliveryErrorMessage(error))
+        && !emailDeliveryErrorMessage(error).includes('test-resend-api-key')
+    );
+
+    status = 403;
+    await assert.rejects(
+      sendEmail('recipient@example.test', message),
+      (error) => error.code === 'EMAIL_DELIVERY_FAILED'
+        && /recipient restrictions/i.test(emailDeliveryErrorMessage(error))
+    );
+
+    networkError = new DOMException('The operation timed out.', 'TimeoutError');
+    await assert.rejects(
+      sendEmail('recipient@example.test', message),
+      (error) => error.code === 'EMAIL_DELIVERY_TIMEOUT'
+        && /Resend request timed out/i.test(emailDeliveryErrorMessage(error))
+    );
+
+    process.env.EMAIL_FROM = '';
+    assert.equal(isEmailConfigured(), false);
+    assert.match(emailConfigurationMessage(), /a valid EMAIL_FROM/);
+    await assert.rejects(
+      sendEmail('recipient@example.test', message),
+      (error) => error.code === 'EMAIL_NOT_CONFIGURED'
     );
   } finally {
     for (const key of keys) {

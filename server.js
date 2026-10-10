@@ -502,11 +502,35 @@ async function generateTemporaryPassword(name, previousPasswordHash = '') {
   }
   throw new Error('Unable to generate a new temporary administrator password.');
 }
-async function createOtp(adminId, purpose, { temporaryPassword } = {}) {
+const otpOperationQueues = new Map();
+async function withOtpOperationLock(adminId, operation) {
+  const previous = otpOperationQueues.get(adminId) || Promise.resolve();
+  let release;
+  const current = new Promise((resolve) => { release = resolve; });
+  otpOperationQueues.set(adminId, current);
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (otpOperationQueues.get(adminId) === current) otpOperationQueues.delete(adminId);
+  }
+}
+
+async function createOtpUnlocked(adminId, purpose, { temporaryPassword } = {}) {
+  const admin = authDb.prepare('SELECT name, email, role FROM admins WHERE id = ?').get(adminId);
+  if (!admin) throw new Error('The administrator account is no longer available.');
+  const previous = authDb.prepare('SELECT * FROM otp_verifications WHERE admin_id = ?').get(adminId);
+  if (previous && Date.now() - previous.last_sent_at < 60_000) {
+    const error = new Error('Please wait one minute before requesting another code.');
+    error.code = 'OTP_RATE_LIMITED';
+    throw error;
+  }
   const code = crypto.randomInt(0, 1_000_000).toString().padStart(6, '0');
   const otpHash = await bcrypt.hash(code, 10);
   const expiresAt = Date.now() + 10 * 60 * 1000;
   const createdAt = new Date().toISOString();
+  const challengeId = crypto.randomUUID();
   authDb.prepare(`
     INSERT INTO otp_verifications (id, admin_id, purpose, otp_hash, expires_at, attempts, last_sent_at, created_at)
     VALUES (?, ?, ?, ?, ?, 0, ?, ?)
@@ -518,9 +542,8 @@ async function createOtp(adminId, purpose, { temporaryPassword } = {}) {
       attempts = 0,
       last_sent_at = excluded.last_sent_at,
       created_at = excluded.created_at
-  `).run(crypto.randomUUID(), adminId, purpose, otpHash, expiresAt, Date.now(), createdAt);
+  `).run(challengeId, adminId, purpose, otpHash, expiresAt, Date.now(), createdAt);
   try {
-    const admin = authDb.prepare('SELECT name, email, role FROM admins WHERE id = ?').get(adminId);
     const emailDetails = {
       to: admin.email,
       name: admin.name,
@@ -534,9 +557,35 @@ async function createOtp(adminId, purpose, { temporaryPassword } = {}) {
     else if (purpose === 'invite') await sendAdminInvitation(emailDetails);
     else await sendAdminOtp(emailDetails);
   } catch (error) {
-    authDb.prepare('DELETE FROM otp_verifications WHERE admin_id = ?').run(adminId);
+    if (previous) {
+      authDb.prepare(`
+        INSERT INTO otp_verifications
+          (id, admin_id, purpose, otp_hash, expires_at, attempts, last_sent_at, created_at, verified)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(admin_id) DO UPDATE SET
+          id = excluded.id, purpose = excluded.purpose, otp_hash = excluded.otp_hash,
+          expires_at = excluded.expires_at, attempts = excluded.attempts,
+          last_sent_at = excluded.last_sent_at, created_at = excluded.created_at,
+          verified = excluded.verified
+      `).run(
+        previous.id,
+        previous.admin_id,
+        previous.purpose,
+        previous.otp_hash,
+        previous.expires_at,
+        previous.attempts,
+        previous.last_sent_at,
+        previous.created_at,
+        previous.verified
+      );
+    } else {
+      authDb.prepare('DELETE FROM otp_verifications WHERE admin_id = ? AND id = ?').run(adminId, challengeId);
+    }
     throw error;
   }
+}
+async function createOtp(adminId, purpose, options) {
+  return withOtpOperationLock(adminId, () => createOtpUnlocked(adminId, purpose, options));
 }
 function sessionAdmin(req) {
   const raw = req.headers.cookie?.match(/(?:^|; )instructor=([^;]+)/)?.[1];
@@ -1536,17 +1585,44 @@ app.post('/api/auth/resend-otp', async (req, res) => {
   const previous = authDb.prepare('SELECT last_sent_at FROM otp_verifications WHERE admin_id = ?').get(admin.id);
   if (previous && Date.now() - previous.last_sent_at < 60_000) return bad(res, 429, 'Please wait one minute before requesting another code.');
   try {
-    if (purpose === 'invite') {
-      const temporaryPassword = await generateTemporaryPassword(admin.name, admin.password_hash);
-      const passwordHash = await hashPassword(temporaryPassword);
-      authDb.prepare(`
-        UPDATE admins SET password_hash = ?, must_change_password = 1, is_active = 1, updated_at = ?
-        WHERE id = ? AND is_verified = 0
-      `).run(passwordHash, new Date().toISOString(), admin.id);
-      await createOtp(admin.id, purpose, { temporaryPassword });
-    } else {
-      await createOtp(admin.id, purpose);
-    }
+    await withOtpOperationLock(admin.id, async () => {
+      const latestChallenge = authDb.prepare('SELECT last_sent_at FROM otp_verifications WHERE admin_id = ?').get(admin.id);
+      if (latestChallenge && Date.now() - latestChallenge.last_sent_at < 60_000) {
+        const error = new Error('Please wait one minute before requesting another code.');
+        error.code = 'OTP_RATE_LIMITED';
+        throw error;
+      }
+      if (purpose === 'invite') {
+        const currentAdmin = authDb.prepare(`
+          SELECT name, password_hash, must_change_password, is_active
+          FROM admins WHERE id = ? AND is_verified = 0
+        `).get(admin.id);
+        if (!currentAdmin) throw new Error('The invitation is no longer valid.');
+        const temporaryPassword = await generateTemporaryPassword(currentAdmin.name, currentAdmin.password_hash);
+        const passwordHash = await hashPassword(temporaryPassword);
+        authDb.prepare(`
+          UPDATE admins SET password_hash = ?, must_change_password = 1, is_active = 1, updated_at = ?
+          WHERE id = ? AND is_verified = 0
+        `).run(passwordHash, new Date().toISOString(), admin.id);
+        try {
+          await createOtpUnlocked(admin.id, purpose, { temporaryPassword });
+        } catch (error) {
+          authDb.prepare(`
+            UPDATE admins SET password_hash = ?, must_change_password = ?, is_active = ?, updated_at = ?
+            WHERE id = ? AND is_verified = 0
+          `).run(
+            currentAdmin.password_hash,
+            currentAdmin.must_change_password,
+            currentAdmin.is_active,
+            new Date().toISOString(),
+            admin.id
+          );
+          throw error;
+        }
+      } else {
+        await createOtpUnlocked(admin.id, purpose);
+      }
+    });
     if (purpose === 'invite' && invitationActor) {
       const now = new Date().toISOString();
       authDb.prepare(`
@@ -1558,12 +1634,7 @@ app.post('/api/auth/resend-otp', async (req, res) => {
     }
     res.json({ ok: true, purpose });
   } catch (error) {
-    if (purpose === 'invite') {
-      authDb.prepare(`
-        UPDATE admins SET password_hash = ?, must_change_password = ?, is_active = ?, updated_at = ?
-        WHERE id = ? AND is_verified = 0
-      `).run(admin.password_hash, admin.must_change_password, admin.is_active, new Date().toISOString(), admin.id);
-    }
+    if (error.code === 'OTP_RATE_LIMITED') return bad(res, 429, error.message);
     console.error('Unable to send admin verification email:', error.message);
     bad(res, 503, emailDeliveryErrorMessage(error));
   }
@@ -1608,9 +1679,18 @@ app.post('/api/auth/verify-otp', async (req, res) => {
 
   const now = new Date().toISOString();
   const completeVerification = authDb.transaction(() => {
-    authDb.prepare('UPDATE otp_verifications SET verified = 1 WHERE id = ?').run(challenge.id);
+    const consumed = authDb.prepare(`
+      UPDATE otp_verifications SET verified = 1
+      WHERE id = ? AND admin_id = ? AND purpose = ? AND verified = 0
+        AND expires_at > ? AND attempts < 5
+    `).run(challenge.id, admin.id, purpose, Date.now());
+    if (consumed.changes !== 1) {
+      const error = new Error('The verification code has already been used or expired.');
+      error.code = 'OTP_NOT_VALID';
+      throw error;
+    }
     authDb.prepare('DELETE FROM otp_verifications WHERE id = ?').run(challenge.id);
-    authDb.prepare(`
+    const updated = authDb.prepare(`
       UPDATE admins SET name = ?, password_hash = ?, is_verified = 1,
         is_active = CASE
         WHEN ? = 1 AND (
@@ -1623,8 +1703,13 @@ app.post('/api/auth/verify-otp', async (req, res) => {
         must_change_password = CASE WHEN ? = 1 THEN 0 ELSE must_change_password END,
         last_password_change_at = CASE WHEN ? = 1 THEN ? ELSE COALESCE(last_password_change_at, ?) END,
         updated_at = ?
-      WHERE id = ? AND role = 'ADMIN'
-    `).run(name, passwordHash, isSignup ? 1 : 0, isReset ? 1 : 0, isReset ? 1 : 0, now, now, now, admin.id);
+      WHERE id = ? AND role = 'ADMIN' AND is_verified = ? AND removed_at IS NULL
+    `).run(name, passwordHash, isSignup ? 1 : 0, isReset ? 1 : 0, isReset ? 1 : 0, now, now, now, admin.id, admin.is_verified);
+    if (updated.changes !== 1) {
+      const error = new Error('The administrator account is no longer eligible for this verification.');
+      error.code = 'OTP_NOT_VALID';
+      throw error;
+    }
     if (purpose === 'verify' && authDb.prepare('SELECT admin_id FROM main_admin_config WHERE singleton = 1').get()?.admin_id === admin.id) {
       authDb.prepare('UPDATE admins SET last_status_change_at = ? WHERE id = ?').run(now, admin.id);
       authDb.prepare(`
@@ -1641,7 +1726,12 @@ app.post('/api/auth/verify-otp', async (req, res) => {
       `).run(admin.id);
     }
   });
-  completeVerification();
+  try {
+    completeVerification();
+  } catch (error) {
+    if (error.code === 'OTP_NOT_VALID') return bad(res, 400, 'The verification request has already been used or is no longer valid.');
+    throw error;
+  }
   let emailNotification = 'not-requested';
   if (isSignup) {
     if (!isEmailConfigured()) emailNotification = 'not-configured';
@@ -2103,10 +2193,28 @@ app.post('/api/admins/:id/approval', requireInstructor, requireMainAdmin, async 
   let otpDeliveryMessage;
   if (decision === 'approve' && !grantResult.isVerified) {
     try {
-      await createOtp(req.params.id, 'verify');
-      otpDelivery = 'sent';
+      let reusedChallenge = false;
+      await withOtpOperationLock(req.params.id, async () => {
+        const currentChallenge = authDb.prepare(`
+          SELECT purpose, expires_at, attempts, verified
+          FROM otp_verifications WHERE admin_id = ?
+        `).get(req.params.id);
+        if (
+          currentChallenge?.purpose === 'verify'
+          && currentChallenge.expires_at > Date.now()
+          && currentChallenge.attempts < 5
+          && !currentChallenge.verified
+        ) {
+          reusedChallenge = true;
+          return;
+        }
+        await createOtpUnlocked(req.params.id, 'verify');
+      });
+      otpDelivery = reusedChallenge ? 'already-sent' : 'sent';
     } catch (error) {
-      otpDelivery = isEmailConfigured() ? 'failed' : 'not-configured';
+      otpDelivery = error.code === 'OTP_RATE_LIMITED'
+        ? 'not-sent'
+        : isEmailConfigured() ? 'failed' : 'not-configured';
       otpDeliveryMessage = emailDeliveryErrorMessage(error);
       console.error('Admin access was approved, but its verification OTP could not be sent:', error.message);
     }
@@ -2353,6 +2461,7 @@ app.post('/api/admins/:id/recovery', requireInstructor, requireMainAdmin, async 
     await createOtp(target.id, 'reset');
   } catch (error) {
     console.error('Unable to initiate admin password recovery:', error.message);
+    if (error.code === 'OTP_RATE_LIMITED') return bad(res, 429, error.message);
     return bad(res, 503, emailDeliveryErrorMessage(error));
   }
   const now = new Date().toISOString();
